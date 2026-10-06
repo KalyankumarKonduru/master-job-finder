@@ -37,6 +37,11 @@ import yaml
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("jobwatch")
 
+# Everything found BEFORE this watcher started is backlog and is never tailored. Only
+# postings first seen during this run are, which is why the per-cycle cap can throttle
+# without dropping: a deferred posting is still >= STARTED_AT on the next cycle.
+STARTED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
 CONFIG_PATH = os.environ.get("JOBWATCH_CONFIG", "config.yaml")
 DB_PATH = os.environ.get("JOBWATCH_DB", "jobs.db")
 _local = threading.local()
@@ -1061,7 +1066,10 @@ def poll_once(cfg, con, tfilter, notifier=None):
     if notifier.failed:
         log.error("%d alert(s) undelivered - will retry next cycle: %s",
                   len(notifier.failed), ", ".join(notifier.failed[:3]))
-    run_tailor(cfg, con, since=now)
+    # since=STARTED_AT, not `now`: pass 1 drops anything already in the DB, so a new
+    # posting pushed past max_per_cycle would otherwise never reach the tailor again.
+    # Scoped to this run, the cap defers work to the next cycle instead of losing it.
+    run_tailor(cfg, con, since=STARTED_AT)
 
 
 def score_then_alert(cfg, con, notifier, queued, min_score):
@@ -1144,10 +1152,14 @@ def run_tailor(cfg, con, since=None):
         jobs = tailor.db_jobs(con, where + " ORDER BY first_seen DESC LIMIT ?",
                               tuple(args + [limit]))
         backlog = con.execute(f"SELECT COUNT(*) FROM jobs WHERE {UNTAILORED}").fetchone()[0]
+        pending = con.execute(f"SELECT COUNT(*) FROM jobs WHERE {UNTAILORED} "
+                              "AND first_seen >= ?", (since,)).fetchone()[0] if since else 0
         if not jobs:
-            if backlog:
-                log.info("no new jobs to tailor (%d older untailored match(es); "
-                         "run `python tailor.py --run` to work through them)", backlog)
+            if pending:
+                log.info("%d posting(s) from this run still queued for tailoring", pending)
+            elif backlog:
+                log.info("all caught up for this run (%d pre-start match(es) ignored "
+                         "by design)", backlog)
             return
 
         templates = tailor.resume_bank.load_templates()
@@ -1156,9 +1168,9 @@ def run_tailor(cfg, con, since=None):
                  ", ".join(t.kind for t in templates))
         tailor.run(cfg, con, templates, bank, skills,
                    tcfg.get("model", tailor.DEFAULT_MODEL), jobs)
-        if backlog > len(jobs):
-            log.info("%d older untailored match(es) left; `python tailor.py --run` to catch up",
-                     backlog - len(jobs))
+        left = max(pending - len(jobs), 0)
+        if left:
+            log.info("%d more from this run queued for the next cycle", left)
     except Exception as e:
         log.error("tailor step failed: %s", e)
 
