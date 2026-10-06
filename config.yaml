@@ -74,10 +74,10 @@ tailor:
   line_spacing: 1.15            # applied to every paragraph, overriding template styles
   output_dir: applications
   page_budget:                  # bullets kept per block; 19 total is the one-page max
-    achievements: 4             # at 1.15 spacing across all four templates
-    community dreams foundation: 6
-    medical informatics engineering: 5
-    accenture: 4
+    achievements: 5             # at 1.15 spacing across all four templates
+    community dreams foundation: 8
+    medical informatics engineering: 7
+    accenture: 6
 
 companies:
   # ---------------- Oracle Recruiting Cloud ----------------
@@ -87,21 +87,21 @@ companies:
     site: CX_1
     location_id: "300000000229164"
     apply_url_base: "https://careers.americanexpress.com/en/sites/CX_1/job/"
-    pages: 2
+    pages: 5
 
   - name: JPMorgan Chase
     ats: oracle
     host: jpmc.fa.oraclecloud.com
     site: CX_1001
     location_id: "300000000289738"     # United States (from your URL)
-    pages: 4                            # JPMC posts a lot; check newest 100 each poll
+    pages: 5                            # JPMC posts a lot; check newest 100 each poll
 
   - name: Goldman Sachs
     ats: oracle
     host: hdpc.fa.us2.oraclecloud.com
     site: LateralHiring
     country: "United States"            # looked up automatically on first run
-    pages: 2
+    pages: 5
 
   # ---------------- Workday ----------------
   # Workday results are relevance-ordered for a search, so we search a few phrases
@@ -112,7 +112,7 @@ companies:
     pod: wd5
     site: External                      # PNC's board is effectively US-only; no country facet exists
     search_texts: ["software engineer", "cloud engineer", "full stack"]
-    pages: 3
+    pages: 5
 
   - name: Bank of America
     ats: workday
@@ -120,7 +120,7 @@ companies:
     pod: wd1
     site: Lateral-US                    # this board is already US-only
     search_texts: ["software engineer", "cloud engineer", "full stack"]
-    pages: 3
+    pages: 5
 
   - name: Citi
     ats: workday
@@ -129,7 +129,7 @@ companies:
     site: "2"
     country: "United States of America"
     search_texts: ["software engineer", "cloud engineer", "full stack", "programmer analyst"]
-    pages: 3
+    pages: 5
 
   # ---------------- Workday (other hosts) ----------------
   - name: Wells Fargo
@@ -138,7 +138,7 @@ companies:
     view_base: "https://wd1.myworkdaysite.com/recruiting/wf/WellsFargoJobs"
     country: "United States of America"
     search_texts: ["software engineer", "cloud engineer", "full stack"]
-    pages: 3
+    pages: 5
 
   - name: Visa
     ats: workday
@@ -147,7 +147,7 @@ companies:
     site: Visa
     country: "United States of America"
     search_texts: ["software engineer", "cloud engineer", "full stack"]
-    pages: 3
+    pages: 5
 
   # ---------------- Greenhouse ----------------
   - name: Stripe
@@ -164,14 +164,14 @@ companies:
     location: "United States"
     distance: 5000                      # without a big radius Eightfold returns only a handful
     search_texts: ["software engineer", "cloud engineer", "full stack"]
-    pages: 4
+    pages: 5
     location_regex: "United States|USA|, [A-Z]{2}$|New York|Chicago|Buffalo|Depew|Arlington"
 
   # ---------------- Amazon ----------------
   - name: Amazon
     ats: amazon
     sort: recent
-    pages: 3                            # newest 60 US software-development roles per poll
+    pages: 5                            # newest 60 US software-development roles per poll
     facets:
       "category[]": software-development
       "job_type[]": Full-Time
@@ -192,7 +192,7 @@ companies:
     country: "United States of America"
     location_regex: "United States|USA|Remote|Chicago|New York|Redwood City|Atlanta|Durham|Boston|San Francisco|Seattle|, [A-Z]{2}\\b"
     search_texts: ["software engineer", "cloud engineer", "full stack"]
-    pages: 3
+    pages: 5
 
   - name: Fractal Analytics
     ats: workday
@@ -202,7 +202,7 @@ companies:
     country: "United States of America"
     location_regex: "United States|USA|Remote|New York|California|Texas|Chicago|Seattle|Jersey City|Atlanta|Boston|, [A-Z]{2}\\b"
     search_texts: ["software engineer", "cloud engineer", "full stack"]
-    pages: 3
+    pages: 5
 
   - name: Synechron
     ats: workday
@@ -212,7 +212,7 @@ companies:
     facets:                             # US facet id taken straight from your URL
       locationCountry: bc33aa3152ec42d4995f4791a106ed09
     search_texts: ["software engineer", "cloud engineer", "full stack"]
-    pages: 3
+    pages: 5
 
   # ---------------- Oracle (added Oct 4) ----------------
   - name: EXL
@@ -221,7 +221,7 @@ companies:
     site: CX_2
     location_id: "300000000467584"      # United States, from your URL
     keyword: "software engineer"        # mostly analytics/BPO roles - filter server-side
-    pages: 2
+    pages: 5
 
   # ---------------- Lever ----------------
   - name: Cirrus Logic
@@ -244,7 +244,7 @@ companies:
     site: CX_1
     location_id: "300000000278000"      # United States, from your URL
     keyword: "software engineer"        # mostly an audit/tax firm - filter server-side
-    pages: 2
+    pages: 5
 
   - name: Emerson
     ats: oracle
@@ -252,7 +252,7 @@ companies:
     site: CX_1
     location_id: "300000000229164"      # United States, from your URL
     keyword: "software engineer"        # mostly manufacturing roles - filter server-side
-    pages: 2
+    pages: 5
 
   # ---------------- Workday (added Oct 5) ----------------
   - name: Grubhub
@@ -263,7 +263,7 @@ companies:
     country: "United States of America"
     location_regex: "United States|USA|Remote|New York|Chicago|Boston|Austin|Denver|, [A-Z]{2}\\b"
     search_texts: ["software engineer", "cloud engineer", "full stack"]
-    pages: 3
+    pages: 5
 
   - name: Elanco
     ats: workday
@@ -273,7 +273,7 @@ companies:
     facets:
       locationCountry: bc33aa3152ec42d4995f4791a106ed09
     search_texts: ["software engineer", "cloud engineer", "full stack"]
-    pages: 3
+    pages: 5
 
   - name: Viavi Solutions
     ats: workday
@@ -283,7 +283,7 @@ companies:
     country: "United States of America"
     location_regex: "USA|United States|Remote|Santa Rosa|Colorado Springs|Indianapolis|Calabasas|Chandler|, [A-Z]{2} USA"
     search_texts: ["software engineer", "cloud engineer", "full stack"]
-    pages: 3
+    pages: 5
 
   # ---------------- Greenhouse (added Oct 5) ----------------
   # Slugs verified against boards-api.greenhouse.io.
@@ -319,7 +319,7 @@ companies:
       RadiusUnitType: 0
       ShowRadius: "False"
       SearchType: 5
-    pages: 3
+    pages: 5
     location_regex: "United States|USA|, [A-Z]{2}\\b|New York|New Jersey|Whippany|Wilmington|Florham"
 
   # ---------------- Not wired up yet (need one request captured from the site) ----------------
