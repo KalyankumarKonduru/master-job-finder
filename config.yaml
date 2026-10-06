@@ -71,14 +71,20 @@ tailor:
   only_new: true                # tailor only jobs found in THIS cycle. false makes every
                                 # cycle also chew through the backlog of older matches.
   compact: true                 # tighten margins and paragraph gaps to fit one page
-  line_spacing: 1.15            # applied to every paragraph, overriding template styles
+  line_spacing: 1            # applied to every paragraph, overriding template styles
   output_dir: applications
-  page_budget:                  # bullets kept per block; these four sum to 26
-    achievements: 5             # 19 was the one-page max at 1.15 spacing, so 26 will
-                                # run onto a second page - check a generated .docx
-    community dreams foundation: 8
-    medical informatics engineering: 7
-    accenture: 6
+  page_budget:
+    achievements: 5             # the one fixed block
+    job_bullets: auto           # first job gets n, the next n-1, the next n-2.
+                                # 'auto' sizes n to fill exactly one page at the
+                                # line_spacing above - lower spacing buys more bullets,
+                                # and more bullets means more evidence to score on.
+                                # Put an integer here to pin n instead (e.g. 11).
+                                # `python tailor.py --fit` shows the maths.
+    # page_lines: 57            # override the estimated lines per page after eyeballing
+    #                           # a generated .docx - raise it if there is space left,
+    #                           # lower it if the resume spills onto page two.
+    # A block named outright (e.g. `accenture: 4`) still wins over the fit.
 
 companies:
   # ---------------- Oracle Recruiting Cloud ----------------

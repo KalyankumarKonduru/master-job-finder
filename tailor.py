@@ -50,10 +50,13 @@ MAX_TOKENS = 16000
 # The defaults below sum to 26, so they intentionally allow a second page; drop to
 # 4/6/5/4 to force one. Override in config.yaml under `tailor: page_budget:` - and
 # re-check the rendered page count whenever you raise these or change line_spacing.
-# A block's cap is enforced in assemble() with a hard break, after Claude has already
-# scored its selection, which is why verify_resume() re-scores the surviving bullets.
-PAGE_BUDGET = {"achievements": 5, "community dreams foundation": 8,
-               "medical informatics engineering": 7, "accenture": 6}
+# A block's cap is enforced in assemble() after Claude has already scored its
+# selection, which is why verify_resume() re-scores the bullets that survive.
+PAGE_BUDGET = {}            # resolved per run - see resolve_budget()
+ACHIEVEMENTS_CAP = 5        # the one fixed block
+JOB_BULLETS = "auto"        # "auto" = fit the page; an int pins the first job at n
+PAGE_LINES = None           # override the estimated lines per page
+EXPLICIT_BLOCKS = set()     # blocks pinned by name in config.yaml, never auto-fitted
 DEFAULT_JOB_BUDGET = 5
 COMPACT = True
 LINE_SPACING = 1.15
@@ -62,8 +65,15 @@ LINE_SPACING = 1.15
 def apply_config(cfg):
     """Let config.yaml override the budget, model and compact layout."""
     global PAGE_BUDGET, DEFAULT_JOB_BUDGET, COMPACT, OUT_DIR, MAX_TOKENS, LINE_SPACING
+    global ACHIEVEMENTS_CAP, JOB_BULLETS, PAGE_LINES, EXPLICIT_BLOCKS
     t = (cfg or {}).get("tailor") or {}
-    PAGE_BUDGET.update({k.lower(): int(v) for k, v in (t.get("page_budget") or {}).items()})
+    pb = {str(k).lower(): v for k, v in (t.get("page_budget") or {}).items()}
+    ACHIEVEMENTS_CAP = int(pb.pop("achievements", ACHIEVEMENTS_CAP))
+    JOB_BULLETS = pb.pop("job_bullets", JOB_BULLETS)
+    pl = pb.pop("page_lines", None)
+    PAGE_LINES = int(pl) if pl else None
+    EXPLICIT_BLOCKS = set(pb)          # a block named outright still wins
+    PAGE_BUDGET.update({k: int(v) for k, v in pb.items()})
     DEFAULT_JOB_BUDGET = int(t.get("default_job_budget", DEFAULT_JOB_BUDGET))
     COMPACT = bool(t.get("compact", COMPACT))
     LINE_SPACING = float(t.get("line_spacing", LINE_SPACING))
@@ -78,7 +88,12 @@ def apply_config(cfg):
 
 # ---------------------------------------------------------------- bullet bank
 def build_bank(templates):
-    """All bullets from all templates, with stable ids: '<kind>:<paragraph idx>'."""
+    """All bullets from all templates, with stable ids: '<kind>:<paragraph idx>'.
+
+    Also resolves the page budget, because every caller loads templates and builds the
+    bank together, and bank_for_prompt() must show Claude the caps it has to respect.
+    """
+    resolve_budget(templates)
     bank, skills = {}, {}
     for t in templates:
         for idx in t.achievements:
@@ -106,6 +121,130 @@ def bank_for_prompt(bank):
     return "\n".join(out)
 
 
+# ---------------------------------------------------------------- page fitting
+# How many bullets fit on one page is not a constant: it depends on line spacing, the
+# margins `compact` applies, the font the template uses and how long the bullets are.
+# A fixed cap therefore either wastes space or overflows. These helpers estimate the
+# page from the template's own geometry so the budget can follow the spacing.
+#
+# No renderer is available (the project deliberately depends only on requests + PyYAML),
+# so this is an ESTIMATE, not a measurement. SAFETY_LINES keeps a margin of error, and
+# `tailor.py --fit` prints the numbers so a real .docx can be used to calibrate.
+TWIPS_PER_INCH = 1440
+COMPACT_MARGINS = {"top": 450, "right": 700, "bottom": 450, "left": 700}  # _tighten_margins
+WORD_LINE_FACTOR = 1.15     # Word's "single" line box is ~1.15x the font size
+CHAR_WIDTH_EM = 0.48        # mean glyph width of a proportional face, in em
+SAFETY_LINES = 3            # slack, because glyph widths vary by more than the mean
+
+
+def _para_text(para):
+    return "".join(t.text or "" for t in para.iter(resume_bank.W + "t"))
+
+
+def _bullet_point_size(tpl):
+    """Font size of the bullets, in points (w:sz is in half-points)."""
+    for i in tpl.bullets:
+        for sz in tpl.paras[i].iter(resume_bank.W + "sz"):
+            try:
+                return int(sz.get(resume_bank.W + "val")) / 2
+            except (TypeError, ValueError):
+                pass
+    return 11.0
+
+
+def page_metrics(tpl, line_spacing=1.0, compact=True):
+    """(lines_per_page, chars_per_line) for this template at this spacing."""
+    m = re.search(r'<w:pgSz w:w="(\d+)" w:h="(\d+)"', tpl.doc_xml)
+    pw, ph = (int(m.group(1)), int(m.group(2))) if m else (12240, 15840)
+    mar = dict(COMPACT_MARGINS)
+    if not compact:
+        mm = re.search(r'<w:pgMar w:top="(\d+)" w:right="(\d+)" w:bottom="(\d+)" w:left="(\d+)"',
+                       tpl.doc_xml)
+        if mm:
+            mar = {"top": int(mm.group(1)), "right": int(mm.group(2)),
+                   "bottom": int(mm.group(3)), "left": int(mm.group(4))}
+    usable_w = (pw - mar["left"] - mar["right"]) / TWIPS_PER_INCH
+    usable_h = (ph - mar["top"] - mar["bottom"]) / TWIPS_PER_INCH
+    pt = _bullet_point_size(tpl)
+    char_w = (pt / 72.0) * CHAR_WIDTH_EM
+    line_h = (pt / 72.0) * WORD_LINE_FACTOR * float(line_spacing)
+    line_h += 20 / TWIPS_PER_INCH            # w:after="20" that compact sets per paragraph
+    return int(usable_h / line_h), max(20, int(usable_w / char_w))
+
+
+def _lines_for(text, chars_per_line):
+    return max(1, -(-len(text) // chars_per_line))        # ceil division
+
+
+def furniture_lines(tpl, chars_per_line):
+    """Lines consumed by everything that is not a bullet: name, contact, section
+    headings, each job's title and company/date line, the SKILLS block, education."""
+    return sum(_lines_for(_para_text(p), chars_per_line)
+               for i, p in enumerate(tpl.paras) if i not in tpl.bullets
+               and _para_text(p).strip())
+
+
+def fit_job_bullets(templates, line_spacing=1.0, compact=True, achievements=5,
+                    page_lines=None, bullet_chars=None):
+    """Largest n that still fits one page, where the first job gets n bullets, the
+    second n-1, the third n-2 and so on. Returns (n, detail) for logging.
+
+    The tightest template wins, since one budget is shared by all of them.
+    """
+    worst = None
+    for tpl in templates:
+        cap, cpl = page_metrics(tpl, line_spacing, compact)
+        cap = page_lines or cap
+        furn = furniture_lines(tpl, cpl)
+        texts = [b["text"] for b in tpl.bullets.values()]
+        # p75 length, so a run of longer-than-average bullets does not overflow
+        p75 = sorted(len(t) for t in texts)[int(len(texts) * 0.75)] if texts else 90
+        per_bullet = _lines_for("x" * (bullet_chars or p75), cpl)
+        budget_lines = cap - furn - SAFETY_LINES - achievements * per_bullet
+        jobs = max(1, len(tpl.jobs))
+        # n + (n-1) + ... for `jobs` terms = jobs*n - (0+1+...+(jobs-1))
+        offset = sum(range(jobs))
+        n = (budget_lines // per_bullet + offset) // jobs
+        detail = {"template": tpl.kind, "lines_per_page": cap, "chars_per_line": cpl,
+                  "furniture": furn, "lines_per_bullet": per_bullet, "n": n}
+        if worst is None or n < worst[0]:
+            worst = (n, detail)
+    n, detail = worst
+    return max(1, int(n)), detail
+
+
+def resolve_budget(templates):
+    """Set PAGE_BUDGET for this run: achievements fixed, each job one bullet fewer than
+    the one before it, and the whole thing sized to a single page at the configured
+    line spacing. A block pinned by name in config.yaml overrides the fitted value."""
+    global PAGE_BUDGET
+    if not templates:
+        return PAGE_BUDGET
+    if str(JOB_BULLETS).strip().lower() == "auto":
+        n, detail = fit_job_bullets(templates, LINE_SPACING, COMPACT,
+                                    ACHIEVEMENTS_CAP, PAGE_LINES)
+        how = f"auto-fit, tightest template {detail['template']}"
+    else:
+        n, how = int(JOB_BULLETS), "pinned in config"
+    budget = budget_for(templates[0], n, ACHIEVEMENTS_CAP)
+    for block in EXPLICIT_BLOCKS:                  # explicit names win over the fit
+        if block in PAGE_BUDGET:
+            budget[block] = PAGE_BUDGET[block]
+    PAGE_BUDGET = budget
+    shape = " + ".join(str(v) for v in budget.values())
+    log.info("page budget: %s = %d bullets (line_spacing %s, %s)",
+             shape, sum(budget.values()), LINE_SPACING, how)
+    return budget
+
+
+def budget_for(tpl, n, achievements=5, floor=1):
+    """{block: cap} with the first job at n, the next n-1, and so on."""
+    out = {"achievements": achievements}
+    for i, job in enumerate(tpl.jobs):
+        out[job["key"]] = max(floor, n - i)
+    return out
+
+
 # ---------------------------------------------------------------- Claude
 SYSTEM = """You tailor a resume by SELECTING pre-written bullets. You never write, \
 edit, paraphrase or invent bullet text — you only choose ids from the bank you are given.
@@ -131,6 +270,7 @@ Return ONLY a JSON object, no prose, no code fences:
 }
 
 Rules:
+- An id may ONLY be listed under the block it appears beneath in the bank. A bullet belongs to one employer; it cannot be moved to another. Listing backend:150 under a block other than its own is an error, not a reordering.
 - Respect each block's stated cap. Order ids strongest-match first; that is the order they print.
 - Prefer a bullet naming the exact tool in the posting over a generic one.
 - Avoid near-duplicate bullets; each one should add new evidence.
@@ -230,33 +370,46 @@ def assemble(plan, bank, templates, out_docx):
     """Render the .docx. Returns (base, used, dropped) — `used` is block -> [texts]
     in the order they appear in the document."""
     base = next((t for t in templates if t.kind == plan.get("base_template")), templates[0])
-    blocks, used, dropped = {}, {}, []
+    blocks, used, dropped, rehomed = {}, {}, [], []
 
+    # Pass 1 - resolve every id to its TRUE block. A bullet's block is a property of the
+    # master template: it is that employer's line, not a slot the model gets to choose.
+    # So an id listed under the wrong block is a misfile, and discarding it silently
+    # deletes evidence the score already counted. Re-home it instead.
+    chosen = {}
     for block, ids in (plan.get("selected") or {}).items():
+        for bid in ids:
+            b = bank.get(bid)
+            if b is None:                       # invented id — nothing to place
+                dropped.append(f"{bid} (not in bank)")
+                continue
+            if b["block"] != block:
+                rehomed.append(f"{bid}: filed under '{block}', belongs to '{b['block']}'")
+            chosen.setdefault(b["block"], []).append(bid)
+
+    # Pass 2 - drop duplicate text, then apply each block's page_budget cap. Ids the
+    # model put in the block itself come first, so a re-homed bullet never displaces
+    # one that was chosen for that block deliberately.
+    for block, ids in chosen.items():
         cap = PAGE_BUDGET.get(block, DEFAULT_JOB_BUDGET)
         nodes, texts, seen = [], [], set()
         for bid in ids:
-            b = bank.get(bid)
-            if b is None:                       # id not in the bank — never reaches the document
-                dropped.append(bid)
-                continue
-            if b["block"] != block:
-                dropped.append(f"{bid} (wrong block)")
-                continue
+            b = bank[bid]
             if b["text"] in seen:
                 dropped.append(f"{bid} (duplicate text)")
+                continue
+            if len(nodes) >= cap:
+                dropped.append(f"{bid} (over the {block} cap of {cap})")
                 continue
             seen.add(b["text"])
             nodes.append(b["tpl"].bullet_node(b["idx"]))
             texts.append(f"{b['text']}   [{b['tpl'].kind}]")
-            if len(nodes) >= cap:
-                break
         blocks[block] = nodes
         used[block] = texts
 
     base.render(blocks, out_docx, skill_text=build_skill_text(base, plan.get("extra_skill_terms") or []),
                 compact=COMPACT, line_spacing=LINE_SPACING)
-    return base, used, dropped
+    return base, used, dropped, rehomed
 
 
 def build_skill_text(base, extra_terms):
@@ -311,36 +464,55 @@ def _kw_present(kw, hay):
     return len(parts) > 1 and any(_term_present(p, hay) for p in parts)
 
 
-def verify_resume(plan, used, base, extra_terms):
-    """Re-check the posting's must-have keywords against the bullets that actually
-    survived into the .docx.
+def verify_resume(plan, used, base, extra_terms, bank=None):
+    """Measure what `assemble` cost the resume, and adjust the score by that much.
 
-    `match_score` is an estimate Claude makes BEFORE the document exists. `assemble`
-    can drop bullets afterwards - an id missing from the bank, an id filed under the
-    wrong block, duplicate text, or anything past a block's page_budget cap - and none
-    of that changes the estimate. This pass produces the number that describes the file
-    on disk. It needs no API call: `assemble` already returns the surviving text.
+    `match_score` is Claude's estimate, made BEFORE the document exists, and it judges
+    evidence semantically - a Kafka consumer bullet can evidence "publish/subscribe"
+    without containing the words. `assemble` can then drop bullets the estimate counted:
+    an id missing from the bank, an id in the wrong block, duplicate text, or anything
+    past a block's page_budget cap.
 
-    A keyword found only in the SKILLS line is reported separately: it is claimed on the
-    resume but no bullet proves it, so it must not inflate the score.
+    Matching keywords literally is far too strict to use as an absolute score - phrases
+    like "two database technologies" or "on-call rotations" never appear verbatim in a
+    bullet. But it IS reliable as a *relative* measure between two sets of the same
+    bullets, so that is all it is used for here: literal coverage of the planned
+    selection versus literal coverage of what survived. Nothing dropped means the ratio
+    is 1 and the score is untouched. Lose half the keyword-bearing bullets and the score
+    halves. No API call: `assemble` already returns the surviving text.
     """
     must = [k for k in (plan.get("must_have_keywords") or []) if str(k).strip()]
+    planned = plan.get("match_score")
     if not must:
         return None
-    bullets = " || ".join(_norm_text(TPL_TAG.sub("", t))
+    doc_hay = " || ".join(_norm_text(TPL_TAG.sub("", t))
                           for items in used.values() for t in items)
+    plan_hay = doc_hay
+    if bank:                       # every bullet Claude chose, before caps and drops
+        chosen = [bank[i]["text"] for ids in (plan.get("selected") or {}).values()
+                  for i in ids if i in bank]
+        if chosen:
+            plan_hay = " || ".join(_norm_text(t) for t in chosen)
     skills = _norm_text(" | ".join(txt for _, txt in base.skill_lines)
                         + " | " + " | ".join(str(t) for t in extra_terms))
+
     confirmed, skills_only, lost = [], [], []
     for kw in must:
-        if _kw_present(kw, bullets):
+        if _kw_present(kw, doc_hay):
             confirmed.append(str(kw))
         elif _kw_present(kw, skills):
             skills_only.append(str(kw))
         else:
             lost.append(str(kw))
-    return {"final_score": int(round(100 * len(confirmed) / len(must))),
+    in_plan = [str(k) for k in must if _kw_present(k, plan_hay)]
+    dropped_evidence = [k for k in in_plan if k not in confirmed]
+
+    ratio = (len(confirmed) / len(in_plan)) if in_plan else 1.0
+    final = planned if planned is None else int(round(planned * ratio))
+    return {"final_score": final, "planned": planned, "ratio": ratio,
             "confirmed": confirmed, "skills_only": skills_only, "lost": lost,
+            "dropped_evidence": dropped_evidence,
+            "coverage_doc": len(confirmed), "coverage_plan": len(in_plan),
             "bullets": sum(len(v) for v in used.values()), "must_total": len(must)}
 
 
@@ -428,7 +600,7 @@ def _render_gap_report(data, md_path):
 
 
 # ---------------------------------------------------------------- report
-def write_report(path, job, plan, used, dropped, base):
+def write_report(path, job, plan, used, dropped, base, rehomed=None):
     chk = plan.get("verified") or {}
     planned = plan.get("match_score")
     score = chk.get("final_score", planned)
@@ -438,11 +610,10 @@ def write_report(path, job, plan, used, dropped, base):
         f"{job.get('url') or ''}", "",
         f"## Match: {score}/100  `{bar}`", "",
     ]
-    if chk and planned is not None and chk["final_score"] != planned:
-        arrow = "dropped" if chk["final_score"] < planned else "rose"
-        lines += [f"> Planned **{planned}/100** before the document was built, "
-                  f"{arrow} to **{chk['final_score']}/100** when checked against the "
-                  f"{chk['bullets']} bullets that actually reached the page.", ""]
+    if chk and chk.get("dropped_evidence"):
+        lines += [f"> Planned **{planned}/100**, reduced to **{chk['final_score']}/100**: "
+                  f"assembly cut bullets that were the only evidence for "
+                  f"{', '.join(chk['dropped_evidence'])}.", ""]
     lines += [
         f"**Base template:** {base.kind}  — {plan.get('base_reason','')}", "",
         f"**Role:** {plan.get('role_summary','')}", "",
@@ -454,18 +625,28 @@ def write_report(path, job, plan, used, dropped, base):
     miss = plan.get("missing_keywords") or []
     lines += (["\n".join(f"- {m}" for m in miss)] if miss else ["_none_"])
     if chk:
-        lines += ["", "## Final check against the job description", "",
-                  f"Re-verified after the .docx was written, against the "
-                  f"{chk['bullets']} bullets that survived assembly "
-                  f"(page_budget caps, duplicates and bad ids all drop bullets after "
-                  f"the planned score is set).", "",
-                  f"**Confirmed by a bullet — {len(chk['confirmed'])} of "
-                  f"{chk['must_total']}:** " + (", ".join(chk["confirmed"]) or "_none_"), ""]
+        lines += ["", "## Final check against the job description", ""]
+        if chk.get("dropped_evidence"):
+            lines += [f"`assemble` wrote {chk['bullets']} bullets and cut the only "
+                      f"literal evidence for **{len(chk['dropped_evidence'])}** "
+                      f"requirement(s), so the score was scaled by "
+                      f"{chk['ratio']:.2f}:", "",
+                      "- " + "\n- ".join(chk["dropped_evidence"]), ""]
+        else:
+            lines += [f"`assemble` wrote all {chk['bullets']} selected bullets with "
+                      f"nothing cut, so the document matches what was scored and the "
+                      f"score stands.", ""]
+        lines += [f"_Literal keyword check (diagnostic, not the score): "
+                  f"{chk['coverage_doc']} of {chk['must_total']} requirements appear "
+                  f"word-for-word in a bullet. This undercounts badly — a Kafka bullet "
+                  f"evidences 'publish/subscribe' without the words, and "
+                  f"'two database technologies' can never match literally. Use it to "
+                  f"spot what is missing, not to judge fit._", ""]
         if chk["skills_only"]:
             lines += ["**Claimed in the SKILLS line only — no bullet proves these:** "
                       + ", ".join(chk["skills_only"]), ""]
         if chk["lost"]:
-            lines += ["**Required but nowhere on the page:** "
+            lines += ["**Not literally present anywhere on the page** (check these by eye): "
                       + ", ".join(chk["lost"]), ""]
     lines += ["", "## Bullets used", ""]
     for block, items in used.items():
@@ -473,8 +654,13 @@ def write_report(path, job, plan, used, dropped, base):
         lines += [f"{i}. {t}" for i, t in enumerate(items, 1)] + [""]
     if plan.get("selection_notes"):
         lines += [f"_{plan['selection_notes']}_", ""]
+    if rehomed:
+        lines += [f"## Re-filed bullets ({len(rehomed)})", "",
+                  "These ids were listed under the wrong block and were moved to the "
+                  "employer they actually belong to, rather than discarded:", "",
+                  "- " + "\n- ".join(rehomed), ""]
     if dropped:
-        lines += ["## Discarded ids (not in your bank)", "", ", ".join(dropped), ""]
+        lines += ["## Discarded ids", "", ", ".join(dropped), ""]
     lines += ["---", f"_generated {datetime.now():%Y-%m-%d %H:%M}_"]
     with open(path, "w") as f:
         f.write("\n".join(lines))
@@ -496,6 +682,10 @@ def tailor_job(job, cfg, templates, bank, skills, model, notify=True, min_score=
     plan = ask_claude(jd, job["title"], job["company"], bank, skills, model)
     score = plan.get("match_score")
 
+    # Cheap pre-filter. The verified score can only ever be <= the planned score
+    # (verify_resume scales by surviving/planned evidence, a ratio of at most 1), so a
+    # posting that fails here could never have cleared the bar after assembly either.
+    # Nothing that would have passed the real gate below is lost by skipping the build.
     if min_score is not None and (score is None or score < min_score):
         base_kind = plan.get("base_template") or "?"
         record_gaps(plan, job, base_kind)
@@ -506,25 +696,36 @@ def tailor_job(job, cfg, templates, bank, skills, model, notify=True, min_score=
     folder = os.path.join(OUT_DIR, f"{safe(job['company'],24)}__{safe(job['title'],40)}__{safe(str(job.get('job_id','')),14)}")
     os.makedirs(folder, exist_ok=True)
     docx = os.path.join(folder, f"KALYANKUMAR_KONDURU_{safe(job['company'],20).upper()}.docx")
-    base, used, dropped = assemble(plan, bank, templates, docx)
+    base, used, dropped, rehomed = assemble(plan, bank, templates, docx)
 
     # Final check: score the document that was actually written, not the plan.
-    check = verify_resume(plan, used, base, plan.get("extra_skill_terms") or [])
+    check = verify_resume(plan, used, base, plan.get("extra_skill_terms") or [], bank)
     if check:
         plan["verified"] = check
         final = check["final_score"]
-        if score is not None and abs(final - score) >= 5:
-            log.warning("[%s] %s - planned %s/100, verified %s/100 against the %d bullets "
-                        "that reached the page", job["company"], job["title"][:50],
-                        score, final, check["bullets"])
+        if check["dropped_evidence"]:
+            log.warning("[%s] %s - %s/100 -> %s/100: assembly cut evidence for %s",
+                        job["company"], job["title"][:50], score, final,
+                        ", ".join(check["dropped_evidence"][:6]))
     else:
         final = score
 
-    write_report(os.path.join(folder, "match_report.md"), job, plan, used, dropped, base)
+    write_report(os.path.join(folder, "match_report.md"), job, plan, used, dropped, base,
+                 rehomed)
     with open(os.path.join(folder, "job_description.txt"), "w") as f:
         f.write(f"{job['title']}\n{job['company']}\n{job.get('url','')}\n\n{jd}")
 
     gaps = record_gaps(plan, job, base.kind)
+
+    # The gate that decides whether this is worth telling you about is applied to the
+    # score of the DOCUMENT, after assembly - not to the plan that preceded it.
+    cleared = min_score is None or final is None or final >= min_score
+    if not cleared:
+        log.info("[%s] %s -> built but verified %s/100 below %s, no alert sent (%s)",
+                 job["company"], job["title"][:50], final, min_score, folder)
+        return {"folder": folder, "score": final, "planned_score": score,
+                "plan": plan, "passed": False}
+
     log.info("[%s] %s -> %s (score %s, base %s)", job["company"], job["title"], folder,
              final, base.kind)
     if gaps:
@@ -548,12 +749,12 @@ def notify_discord(job, plan, folder):
     fields = [{"name": "Role", "value": job["title"][:250], "inline": False},
               {"name": "Base template", "value": plan.get("base_template", "?"), "inline": True}]
     if chk:
-        verdict = (f"**{score}/100** verified on {chk['bullets']} bullets"
-                   + (f" · planned {planned}" if score != planned else " · matches plan"))
-        fields.append({"name": "Final check", "value": verdict[:1000], "inline": True})
-        if chk["lost"]:
-            fields.append({"name": "Required but not on the page",
-                           "value": ", ".join(chk["lost"])[:1000], "inline": False})
+        if chk.get("dropped_evidence"):
+            verdict = (f"{planned} -> **{score}** · assembly cut evidence for "
+                       + ", ".join(chk["dropped_evidence"][:6]))
+        else:
+            verdict = f"**{score}/100** · all {chk['bullets']} selected bullets made the page"
+        fields.append({"name": "Final check", "value": verdict[:1000], "inline": False})
         if chk["skills_only"]:
             fields.append({"name": "In SKILLS only, no bullet proof",
                            "value": ", ".join(chk["skills_only"])[:1000], "inline": False})
@@ -628,6 +829,8 @@ def run(cfg, con, templates, bank, skills, model, jobs, notify=True, min_score=N
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--fit", action="store_true",
+                    help="show the one-page budget and the geometry behind it")
     ap.add_argument("--run", action="store_true", help="tailor all untailored matches")
     ap.add_argument("--job", type=int, help="tailor one job by # from --list")
     ap.add_argument("--url", help="tailor an arbitrary posting URL")
@@ -690,6 +893,22 @@ def main():
 
     if a.job:
         jobs = db_jobs(con, "rowid=?", (a.job,))
+    elif a.fit:
+        for sp in sorted({LINE_SPACING, 1.0, 1.15}):
+            n, d = fit_job_bullets(templates, sp, COMPACT, ACHIEVEMENTS_CAP, PAGE_LINES)
+            caps = budget_for(templates[0], n, ACHIEVEMENTS_CAP)
+            mark = "  <- current" if abs(sp - LINE_SPACING) < 1e-9 else ""
+            print(f"\nline_spacing {sp}{mark}")
+            print(f"  page holds ~{d['lines_per_page']} lines of {d['chars_per_line']} chars; "
+                  f"{d['furniture']} go to headers/skills, {SAFETY_LINES} held back as slack")
+            print(f"  tightest template: {d['template']}  "
+                  f"({d['lines_per_bullet']} line(s) per bullet at the 75th-percentile length)")
+            print(f"  budget: " + " + ".join(f"{k}={v}" for k, v in caps.items())
+                  + f"  = {sum(caps.values())} bullets")
+        print("\nThis is an estimate from the template's geometry, not a render. Open a "
+              "generated .docx;\nif space is left over raise page_lines, if it spills "
+              "onto page two lower it.")
+        return
     elif a.run:
         jobs = db_jobs(con, "matched=1 AND (tailored IS NULL OR tailored='') "
                             "ORDER BY first_seen DESC LIMIT ?", (a.limit,))
