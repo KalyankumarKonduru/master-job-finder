@@ -1,7 +1,7 @@
 # How often to poll (minutes). A little random jitter is added.
 poll_interval_minutes: 2      # fixed rate: cycle time counts toward this
 jitter_seconds: 10            # small random offset so polls aren't perfectly clockwork
-max_parallel: 8
+max_parallel: 12
 # Cap alerts per company per cycle. Anything past the cap arrives as one digest
 # message of links instead of N separate alerts. 0 = no cap.
 max_alerts_per_company: 12
@@ -73,8 +73,9 @@ tailor:
   compact: true                 # tighten margins and paragraph gaps to fit one page
   line_spacing: 1.15            # applied to every paragraph, overriding template styles
   output_dir: applications
-  page_budget:                  # bullets kept per block; 19 total is the one-page max
-    achievements: 5             # at 1.15 spacing across all four templates
+  page_budget:                  # bullets kept per block; these four sum to 26
+    achievements: 5             # 19 was the one-page max at 1.15 spacing, so 26 will
+                                # run onto a second page - check a generated .docx
     community dreams foundation: 8
     medical informatics engineering: 7
     accenture: 6

@@ -45,10 +45,13 @@ DEFAULT_MODEL = "claude-sonnet-5"
 MAX_JD_CHARS = 18000
 MAX_TOKENS = 16000
 
-# One-page budget: how many bullets survive in each block. 19 bullets is the most that
-# fits on one page at 1.15 line spacing across all four templates (cloud_devops has the
-# longest bullets and sets the limit). Override in config.yaml under `tailor:
-# page_budget:` - and re-check the page count if you raise it or change line_spacing.
+# Bullets kept per block. 19 is the most that fits on ONE page at 1.15 line spacing
+# across all four templates (cloud_devops has the longest bullets and sets the limit).
+# The defaults below sum to 26, so they intentionally allow a second page; drop to
+# 4/6/5/4 to force one. Override in config.yaml under `tailor: page_budget:` - and
+# re-check the rendered page count whenever you raise these or change line_spacing.
+# A block's cap is enforced in assemble() with a hard break, after Claude has already
+# scored its selection, which is why verify_resume() re-scores the surviving bullets.
 PAGE_BUDGET = {"achievements": 5, "community dreams foundation": 8,
                "medical informatics engineering": 7, "accenture": 6}
 DEFAULT_JOB_BUDGET = 5
@@ -271,6 +274,76 @@ def build_skill_text(base, extra_terms):
     return out
 
 
+# ---------------------------------------------------------------- final check
+TPL_TAG = re.compile(r"\s*\[(?:backend|cloud_devops|frontend|fullstack)\]\s*$")
+
+
+def _norm_text(s):
+    s = str(s or "").lower()
+    s = re.sub(r"[^a-z0-9+#./ -]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _term_present(term, hay):
+    """Word-boundary match, so 'C' does not match 'cloud' but 'c++' and 'ci/cd' do.
+    Plurals are matched in both directions: a posting asking for 'REST API' is satisfied
+    by a bullet saying 'REST APIs', and vice versa."""
+    t = _norm_text(term)
+    if not t:
+        return False
+    edge = r"[a-z0-9+#]"
+    variants = [t]
+    if len(t) > 3 and t.endswith("s"):
+        variants.append(t[:-1])
+    elif len(t) > 2 and t[-1].isalpha():
+        variants.append(t + "s")
+    return any(re.search(f"(?<!{edge})" + re.escape(v) + f"(?!{edge})", hay)
+               for v in variants)
+
+
+def _kw_present(kw, hay):
+    """A requirement counts as present if it appears, or - for 'A/B/C' style wording,
+    which a posting means as 'any of these' - if any one of its parts appears."""
+    base = re.sub(r"\(.*?\)", " ", str(kw))
+    if _term_present(base, hay):
+        return True
+    parts = [p for p in re.split(r"[/,]| or ", base) if len(p.strip()) > 1]
+    return len(parts) > 1 and any(_term_present(p, hay) for p in parts)
+
+
+def verify_resume(plan, used, base, extra_terms):
+    """Re-check the posting's must-have keywords against the bullets that actually
+    survived into the .docx.
+
+    `match_score` is an estimate Claude makes BEFORE the document exists. `assemble`
+    can drop bullets afterwards - an id missing from the bank, an id filed under the
+    wrong block, duplicate text, or anything past a block's page_budget cap - and none
+    of that changes the estimate. This pass produces the number that describes the file
+    on disk. It needs no API call: `assemble` already returns the surviving text.
+
+    A keyword found only in the SKILLS line is reported separately: it is claimed on the
+    resume but no bullet proves it, so it must not inflate the score.
+    """
+    must = [k for k in (plan.get("must_have_keywords") or []) if str(k).strip()]
+    if not must:
+        return None
+    bullets = " || ".join(_norm_text(TPL_TAG.sub("", t))
+                          for items in used.values() for t in items)
+    skills = _norm_text(" | ".join(txt for _, txt in base.skill_lines)
+                        + " | " + " | ".join(str(t) for t in extra_terms))
+    confirmed, skills_only, lost = [], [], []
+    for kw in must:
+        if _kw_present(kw, bullets):
+            confirmed.append(str(kw))
+        elif _kw_present(kw, skills):
+            skills_only.append(str(kw))
+        else:
+            lost.append(str(kw))
+    return {"final_score": int(round(100 * len(confirmed) / len(must))),
+            "confirmed": confirmed, "skills_only": skills_only, "lost": lost,
+            "bullets": sum(len(v) for v in used.values()), "must_total": len(must)}
+
+
 # ---------------------------------------------------------------- keyword gaps
 GAP_DIR_NAME = "_gaps"
 
@@ -356,12 +429,21 @@ def _render_gap_report(data, md_path):
 
 # ---------------------------------------------------------------- report
 def write_report(path, job, plan, used, dropped, base):
-    score = plan.get("match_score")
+    chk = plan.get("verified") or {}
+    planned = plan.get("match_score")
+    score = chk.get("final_score", planned)
     bar = "#" * int(round((score or 0) / 5)) + "." * (20 - int(round((score or 0) / 5)))
     lines = [
         f"# {job['title']}", f"**{job['company']}** · {job.get('location') or 'n/a'}",
         f"{job.get('url') or ''}", "",
         f"## Match: {score}/100  `{bar}`", "",
+    ]
+    if chk and planned is not None and chk["final_score"] != planned:
+        arrow = "dropped" if chk["final_score"] < planned else "rose"
+        lines += [f"> Planned **{planned}/100** before the document was built, "
+                  f"{arrow} to **{chk['final_score']}/100** when checked against the "
+                  f"{chk['bullets']} bullets that actually reached the page.", ""]
+    lines += [
         f"**Base template:** {base.kind}  — {plan.get('base_reason','')}", "",
         f"**Role:** {plan.get('role_summary','')}", "",
         f"**Verdict:** {plan.get('fit_assessment','')}", "",
@@ -371,6 +453,20 @@ def write_report(path, job, plan, used, dropped, base):
     ]
     miss = plan.get("missing_keywords") or []
     lines += (["\n".join(f"- {m}" for m in miss)] if miss else ["_none_"])
+    if chk:
+        lines += ["", "## Final check against the job description", "",
+                  f"Re-verified after the .docx was written, against the "
+                  f"{chk['bullets']} bullets that survived assembly "
+                  f"(page_budget caps, duplicates and bad ids all drop bullets after "
+                  f"the planned score is set).", "",
+                  f"**Confirmed by a bullet — {len(chk['confirmed'])} of "
+                  f"{chk['must_total']}:** " + (", ".join(chk["confirmed"]) or "_none_"), ""]
+        if chk["skills_only"]:
+            lines += ["**Claimed in the SKILLS line only — no bullet proves these:** "
+                      + ", ".join(chk["skills_only"]), ""]
+        if chk["lost"]:
+            lines += ["**Required but nowhere on the page:** "
+                      + ", ".join(chk["lost"]), ""]
     lines += ["", "## Bullets used", ""]
     for block, items in used.items():
         lines.append(f"**{block}**")
@@ -411,35 +507,61 @@ def tailor_job(job, cfg, templates, bank, skills, model, notify=True, min_score=
     os.makedirs(folder, exist_ok=True)
     docx = os.path.join(folder, f"KALYANKUMAR_KONDURU_{safe(job['company'],20).upper()}.docx")
     base, used, dropped = assemble(plan, bank, templates, docx)
+
+    # Final check: score the document that was actually written, not the plan.
+    check = verify_resume(plan, used, base, plan.get("extra_skill_terms") or [])
+    if check:
+        plan["verified"] = check
+        final = check["final_score"]
+        if score is not None and abs(final - score) >= 5:
+            log.warning("[%s] %s - planned %s/100, verified %s/100 against the %d bullets "
+                        "that reached the page", job["company"], job["title"][:50],
+                        score, final, check["bullets"])
+    else:
+        final = score
+
     write_report(os.path.join(folder, "match_report.md"), job, plan, used, dropped, base)
     with open(os.path.join(folder, "job_description.txt"), "w") as f:
         f.write(f"{job['title']}\n{job['company']}\n{job.get('url','')}\n\n{jd}")
 
     gaps = record_gaps(plan, job, base.kind)
     log.info("[%s] %s -> %s (score %s, base %s)", job["company"], job["title"], folder,
-             plan.get("match_score"), base.kind)
+             final, base.kind)
     if gaps:
         log.info("  %d gap keyword(s) pooled into %s",
                  len(plan.get("missing_keywords") or []), gaps)
     if notify:
         notify_discord(job, plan, folder)
-    return {"folder": folder, "score": score, "plan": plan, "passed": True}
+    return {"folder": folder, "score": final, "planned_score": score,
+            "plan": plan, "passed": True}
 
 
 def notify_discord(job, plan, folder):
     hook = os.environ.get("DISCORD_WEBHOOK_URL")
     if not hook:
         return
-    score = plan.get("match_score") or 0
+    chk = plan.get("verified") or {}
+    planned = plan.get("match_score") or 0
+    score = chk.get("final_score", planned)
     color = 0x43B581 if score >= 75 else (0xFAA61A if score >= 55 else 0xED4245)
     miss = ", ".join((plan.get("missing_keywords") or [])[:12]) or "none"
+    fields = [{"name": "Role", "value": job["title"][:250], "inline": False},
+              {"name": "Base template", "value": plan.get("base_template", "?"), "inline": True}]
+    if chk:
+        verdict = (f"**{score}/100** verified on {chk['bullets']} bullets"
+                   + (f" · planned {planned}" if score != planned else " · matches plan"))
+        fields.append({"name": "Final check", "value": verdict[:1000], "inline": True})
+        if chk["lost"]:
+            fields.append({"name": "Required but not on the page",
+                           "value": ", ".join(chk["lost"])[:1000], "inline": False})
+        if chk["skills_only"]:
+            fields.append({"name": "In SKILLS only, no bullet proof",
+                           "value": ", ".join(chk["skills_only"])[:1000], "inline": False})
+    fields += [{"name": "Folder", "value": f"`{folder}`"[:1000], "inline": False},
+               {"name": "Gaps", "value": miss[:1000], "inline": False}]
     embed = {"title": f"📄 Resume ready — {score}/100"[:250], "url": job.get("url") or None,
              "description": (plan.get("fit_assessment") or "")[:600], "color": color,
-             "fields": [
-                 {"name": "Role", "value": job["title"][:250], "inline": False},
-                 {"name": "Base template", "value": plan.get("base_template", "?"), "inline": True},
-                 {"name": "Folder", "value": f"`{folder}`"[:1000], "inline": False},
-                 {"name": "Gaps", "value": miss[:1000], "inline": False}]}
+             "fields": fields}
     try:
         requests.post(hook, json={"embeds": [embed]}, timeout=15)
     except Exception as e:

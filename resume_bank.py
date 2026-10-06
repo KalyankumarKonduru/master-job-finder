@@ -137,13 +137,16 @@ class Template:
                 self.skill_lines.append((i, txt))
 
     # ---------------------------------------------------------------- rebuilding
-    def render(self, blocks, out_path, skill_text=None, compact=False):
+    def render(self, blocks, out_path, skill_text=None, compact=False, line_spacing=None):
         """Write a .docx whose bullets are exactly `blocks`, in the order given.
 
         blocks:     {"achievements"|<job key>: [paragraph Element, ...]} - each element is a
                     bullet paragraph copied verbatim from some master template.
         skill_text: {paragraph_idx: new_text} for the SKILLS lines only.
         compact:    tighten margins/line spacing so a one-page selection fits one page.
+        line_spacing: multiplier applied to every paragraph, overriding the template's
+                    own styles. 1.0 is single, 1.15 is Word's default "1.15". None
+                    leaves the template alone.
 
         Every bullet paragraph originates in a template; nothing is written or reworded.
         """
@@ -181,8 +184,11 @@ class Template:
         parts = {}
         if compact:
             new_xml = _tighten_margins(new_xml)
+        if compact or line_spacing:
             with zipfile.ZipFile(self.path) as z:
-                parts["word/styles.xml"] = _tighten_spacing(z.read("word/styles.xml").decode("utf-8"))
+                parts["word/styles.xml"] = _tighten_spacing(
+                    z.read("word/styles.xml").decode("utf-8"),
+                    line_spacing=line_spacing, compact=compact)
         parts["word/document.xml"] = new_xml
         shutil.copy(self.path, out_path)
         _replace_in_zip(out_path, parts)
@@ -214,11 +220,31 @@ def _tighten_margins(xml):
                   'w:header="360" w:footer="360" w:gutter="0"/>', xml)
 
 
-def _tighten_spacing(styles_xml):
-    """Single line spacing and a small gap after paragraphs, everywhere."""
-    out = re.sub(r'<w:spacing w:after="\d+" w:line="\d+" w:lineRule="auto"/>',
-                 '<w:spacing w:after="20" w:line="240" w:lineRule="auto"/>', styles_xml)
-    return re.sub(r'<w:spacing w:after="\d+"/>', '<w:spacing w:after="20"/>', out)
+def _tighten_spacing(styles_xml, line_spacing=None, compact=True):
+    """Rewrite paragraph spacing in styles.xml.
+
+    line_spacing is a multiplier - 1.0 single, 1.15 Word's default "1.15". Word stores
+    it in 240ths of a line, so 1.15 becomes 276. None keeps the template's own spacing
+    (or forces single when `compact` is set, which is the historical behaviour).
+    compact also pulls the gap after each paragraph down to 20 twentieths of a point.
+    """
+    line = int(round(240 * float(line_spacing))) if line_spacing else (240 if compact else None)
+    after = "20" if compact else None
+
+    def _full(m):
+        a = after if after is not None else m.group(1)
+        l = line if line is not None else m.group(2)
+        return f'<w:spacing w:after="{a}" w:line="{l}" w:lineRule="auto"/>'
+
+    out = re.sub(r'<w:spacing w:after="(\d+)" w:line="(\d+)" w:lineRule="auto"/>', _full, styles_xml)
+    if after is not None:
+        out = re.sub(r'<w:spacing w:after="\d+"/>', f'<w:spacing w:after="{after}"/>', out)
+    if line is not None:
+        # paragraphs that declare only `after` need an explicit rule to be respaced
+        out = re.sub(r'<w:spacing w:after="(\d+)"/>',
+                     lambda m: f'<w:spacing w:after="{m.group(1)}" w:line="{line}" '
+                               f'w:lineRule="auto"/>', out)
+    return out
 
 
 def load_templates(directory=None):
