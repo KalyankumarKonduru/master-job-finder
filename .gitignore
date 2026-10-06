@@ -1,0 +1,53 @@
+# ---- secrets -------------------------------------------------------------
+# All credentials come from the environment (ANTHROPIC_API_KEY,
+# DISCORD_WEBHOOK_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID). Never commit them.
+.env
+.env.*
+*.pem
+*.key
+
+# ---- personal output -----------------------------------------------------
+# Tailored resumes, scraped job descriptions and match reports. These contain
+# personal contact details and employment history; they stay local.
+applications/
+
+# Seen-job database: scraped postings and application history.
+jobs.db
+*.db
+*.sqlite
+*.sqlite3
+
+# Local resume working files.
+resume-playbook-gaps.md
+
+# Master resume .docx templates, wherever they land in the tree.
+*.docx
+~$*
+
+# ---- python --------------------------------------------------------------
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- node (none today, but keeps a future UI clean) ----------------------
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# ---- editors / os --------------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Stray zero-byte files from a mistyped shell command.
+full stack,
+senior,
+spaces.

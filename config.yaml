@@ -1,0 +1,327 @@
+# How often to poll (minutes). A little random jitter is added.
+poll_interval_minutes: 2      # fixed rate: cycle time counts toward this
+jitter_seconds: 10            # small random offset so polls aren't perfectly clockwork
+max_parallel: 8
+# Cap alerts per company per cycle. Anything past the cap arrives as one digest
+# message of links instead of N separate alerts. 0 = no cap.
+max_alerts_per_company: 12
+
+# Visa sponsorship screening. The job description is fetched BEFORE the alert, so a
+# posting that rules out sponsorship never reaches Discord and is never tailored.
+skip_no_sponsorship: true
+on_unknown_sponsorship: alert   # 'alert' keeps unclear postings; 'skip' drops them too
+
+# Skip postings whose REQUIRED section asks for more than this many years. Preferred
+# and nice-to-have sections are ignored. Leave blank to turn the screen off.
+max_years_experience: 5
+
+# Only alert, and only build a resume, when the posting scores at least this against
+# your bullet bank. Scoring costs one API call per new match, so alerts now wait on
+# that call - see "Score gate" in the README. Remove this line to alert on everything.
+min_match_score: 65          # boards fetched concurrently
+
+# Title filters are regexes matched against a NORMALIZED title:
+# lowercase, "sr." -> "senior", "full-stack"/"fullstack" -> "full stack", punctuation -> spaces.
+titles:
+  include:
+    - '\bsoftware (development )?engineer'
+    - '\b(software|application|applications|engineering|java|python|net|cloud|full stack|back end|backend|front end|frontend) developer'
+    - '\bswe\b'
+    - '\bsoftware dev(elopment)? engineer'      # Amazon: "Software Dev Engineer II"
+    - '\bsde\b'
+    - '\bfull stack (software )?engineer'
+    - '\b(back end|backend|front end|frontend) engineer'
+    - '\bcloud (infrastructure |platform |devops |software )?engineer'
+    - '\bapplications? engineer'
+    - '\bprogrammer analyst'            # Citi's classic SWE title
+    - '^(senior |lead )?engineer( [iv]+)?\b'   # AmEx-style "Engineer III", "Sr. Engineer"
+    # - '\bsite reliability engineer'
+    # - '\b(ai|agentic ai|ml|machine learning) engineer'
+  exclude:
+    - '\bintern(ship)?\b'
+    - '\bapprentice'
+    - '\bsummer analyst\b'
+    - '\bmanager\b'
+    - '\bdirector\b'
+    - '\bprincipal\b'
+    - '\bdistinguished\b'
+    - '\bsales engineer'
+    - '\b(qa|quality|test|testing)\b.*\bengineer'
+    - '\bin test\b'
+    - '\bdata center\b'
+    # NOTE: VP / AVP / Associate are NOT excluded - at banks these are rank titles
+    # on regular engineering roles (e.g. "Software Engineer - VP").
+    # - '\bstaff\b'
+
+# Resume tailoring. Runs after alerts go out, so it never delays a notification.
+# Needs ANTHROPIC_API_KEY. Output lands in ./applications/<Company>__<Title>__<id>/
+tailor:
+  enabled: true
+  templates_dir: ~/Downloads/comet   # folder holding your master resume .docx files
+  # Only these files are treated as master templates. Without this, every .docx in the
+  # folder joins the bullet bank - including resumes this tool generated earlier.
+  templates_include:
+    - "KALYANKUMAR_KONDURU_BACKEND.docx"
+    - "KALYANKUMAR_KONDURU_CLOUD_DEVOPS.docx"
+    - "KALYANKUMAR_KONDURU_FRONTEND.docx"
+    - "KALYANKUMAR_KONDURU_FULLSTACK.docx"
+  max_tokens: 16000             # reasoning tokens count against this; unused ceiling costs nothing
+  model: claude-haiku-4-5-20251001        #  claude-sonnet-5 is cheaper/faster
+  max_per_cycle: 5              # cap postings SCORED per poll; the rest wait a cycle
+  only_new: true                # tailor only jobs found in THIS cycle. false makes every
+                                # cycle also chew through the backlog of older matches.
+  compact: true                 # tighten margins and paragraph gaps to fit one page
+  line_spacing: 1.15            # applied to every paragraph, overriding template styles
+  output_dir: applications
+  page_budget:                  # bullets kept per block; 19 total is the one-page max
+    achievements: 4             # at 1.15 spacing across all four templates
+    community dreams foundation: 6
+    medical informatics engineering: 5
+    accenture: 4
+
+companies:
+  # ---------------- Oracle Recruiting Cloud ----------------
+  - name: American Express
+    ats: oracle
+    host: egug.fa.us2.oraclecloud.com
+    site: CX_1
+    location_id: "300000000229164"
+    apply_url_base: "https://careers.americanexpress.com/en/sites/CX_1/job/"
+    pages: 2
+
+  - name: JPMorgan Chase
+    ats: oracle
+    host: jpmc.fa.oraclecloud.com
+    site: CX_1001
+    location_id: "300000000289738"     # United States (from your URL)
+    pages: 4                            # JPMC posts a lot; check newest 100 each poll
+
+  - name: Goldman Sachs
+    ats: oracle
+    host: hdpc.fa.us2.oraclecloud.com
+    site: LateralHiring
+    country: "United States"            # looked up automatically on first run
+    pages: 2
+
+  # ---------------- Workday ----------------
+  # Workday results are relevance-ordered for a search, so we search a few phrases
+  # and check the top pages of each. Dedup makes repeats harmless.
+  - name: PNC
+    ats: workday
+    tenant: pnc
+    pod: wd5
+    site: External                      # PNC's board is effectively US-only; no country facet exists
+    search_texts: ["software engineer", "cloud engineer", "full stack"]
+    pages: 3
+
+  - name: Bank of America
+    ats: workday
+    tenant: ghr
+    pod: wd1
+    site: Lateral-US                    # this board is already US-only
+    search_texts: ["software engineer", "cloud engineer", "full stack"]
+    pages: 3
+
+  - name: Citi
+    ats: workday
+    tenant: citi
+    pod: wd5
+    site: "2"
+    country: "United States of America"
+    search_texts: ["software engineer", "cloud engineer", "full stack", "programmer analyst"]
+    pages: 3
+
+  # ---------------- Workday (other hosts) ----------------
+  - name: Wells Fargo
+    ats: workday
+    api_base: "https://wd1.myworkdaysite.com/wday/cxs/wf/WellsFargoJobs"
+    view_base: "https://wd1.myworkdaysite.com/recruiting/wf/WellsFargoJobs"
+    country: "United States of America"
+    search_texts: ["software engineer", "cloud engineer", "full stack"]
+    pages: 3
+
+  - name: Visa
+    ats: workday
+    tenant: visa
+    pod: wd5
+    site: Visa
+    country: "United States of America"
+    search_texts: ["software engineer", "cloud engineer", "full stack"]
+    pages: 3
+
+  # ---------------- Greenhouse ----------------
+  - name: Stripe
+    ats: greenhouse
+    slug: stripe
+    location_regex: "United States|US|Remote|New York|San Francisco|Seattle|Chicago|Bellevue|Austin|Boston"
+
+  # ---------------- Eightfold ----------------
+  - name: HSBC
+    ats: eightfold
+    enabled: false                      # returns 0 postings; needs a cURL capture to fix
+    host: portal.careers.hsbc.com
+    domain: hsbc.com
+    location: "United States"
+    distance: 5000                      # without a big radius Eightfold returns only a handful
+    search_texts: ["software engineer", "cloud engineer", "full stack"]
+    pages: 4
+    location_regex: "United States|USA|, [A-Z]{2}$|New York|Chicago|Buffalo|Depew|Arlington"
+
+  # ---------------- Amazon ----------------
+  - name: Amazon
+    ats: amazon
+    sort: recent
+    pages: 3                            # newest 60 US software-development roles per poll
+    facets:
+      "category[]": software-development
+      "job_type[]": Full-Time
+      "country[]": USA
+    # Amazon posts ~40 new US SWE roles a day. Narrow with one of these or you get
+    # a firehose: a keyword, or cities you would actually move to.
+    # keyword: "full stack"
+    # location_regex: "Seattle|Bellevue|Austin|New York|Arlington|Chicago|Boston|Remote"
+    # Your URL also had industry_experience=four_to_six_years; left out so nothing is
+    # filtered away before the title filter sees it. Add it under facets to restore.
+
+  # ---------------- Workday (added Oct 4) ----------------
+  - name: Tempus AI
+    ats: workday
+    tenant: tempus
+    pod: wd5
+    site: Tempus_Careers
+    country: "United States of America"
+    location_regex: "United States|USA|Remote|Chicago|New York|Redwood City|Atlanta|Durham|Boston|San Francisco|Seattle|, [A-Z]{2}\\b"
+    search_texts: ["software engineer", "cloud engineer", "full stack"]
+    pages: 3
+
+  - name: Fractal Analytics
+    ats: workday
+    tenant: fractal
+    pod: wd1
+    site: Careers
+    country: "United States of America"
+    location_regex: "United States|USA|Remote|New York|California|Texas|Chicago|Seattle|Jersey City|Atlanta|Boston|, [A-Z]{2}\\b"
+    search_texts: ["software engineer", "cloud engineer", "full stack"]
+    pages: 3
+
+  - name: Synechron
+    ats: workday
+    tenant: synechron
+    pod: wd1
+    site: SynechronCareers
+    facets:                             # US facet id taken straight from your URL
+      locationCountry: bc33aa3152ec42d4995f4791a106ed09
+    search_texts: ["software engineer", "cloud engineer", "full stack"]
+    pages: 3
+
+  # ---------------- Oracle (added Oct 4) ----------------
+  - name: EXL
+    ats: oracle
+    host: fa-ewjt-saasfaprod1.fa.ocs.oraclecloud.com
+    site: CX_2
+    location_id: "300000000467584"      # United States, from your URL
+    keyword: "software engineer"        # mostly analytics/BPO roles - filter server-side
+    pages: 2
+
+  # ---------------- Lever ----------------
+  - name: Cirrus Logic
+    ats: lever
+    slug: cirrus
+    eu: true                            # board is jobs.eu.lever.co
+    location_regex: "Austin|United States|USA|, [A-Z]{2}\\b|Remote"
+
+  # ---------------- Ashby ----------------
+  - name: Gen Digital
+    ats: ashby
+    slug: gen-digital
+    employment_type: FullTime
+    location_regex: "USA|United States|Remote|, [A-Z]{2}$|Tempe|Tucson|Mountain View"
+
+  # ---------------- Oracle (added Oct 5) ----------------
+  - name: Grant Thornton
+    ats: oracle
+    host: ehzq.fa.us2.oraclecloud.com
+    site: CX_1
+    location_id: "300000000278000"      # United States, from your URL
+    keyword: "software engineer"        # mostly an audit/tax firm - filter server-side
+    pages: 2
+
+  - name: Emerson
+    ats: oracle
+    host: hdjq.fa.us2.oraclecloud.com
+    site: CX_1
+    location_id: "300000000229164"      # United States, from your URL
+    keyword: "software engineer"        # mostly manufacturing roles - filter server-side
+    pages: 2
+
+  # ---------------- Workday (added Oct 5) ----------------
+  - name: Grubhub
+    ats: workday
+    tenant: wonder                      # Grubhub's Workday tenant is "wonder"
+    pod: wd1
+    site: Grubhub_Careers
+    country: "United States of America"
+    location_regex: "United States|USA|Remote|New York|Chicago|Boston|Austin|Denver|, [A-Z]{2}\\b"
+    search_texts: ["software engineer", "cloud engineer", "full stack"]
+    pages: 3
+
+  - name: Elanco
+    ats: workday
+    tenant: elanco
+    pod: wd5
+    site: External_Career
+    facets:
+      locationCountry: bc33aa3152ec42d4995f4791a106ed09
+    search_texts: ["software engineer", "cloud engineer", "full stack"]
+    pages: 3
+
+  - name: Viavi Solutions
+    ats: workday
+    tenant: viavisolutions
+    pod: wd1
+    site: careers
+    country: "United States of America"
+    location_regex: "USA|United States|Remote|Santa Rosa|Colorado Springs|Indianapolis|Calabasas|Chandler|, [A-Z]{2} USA"
+    search_texts: ["software engineer", "cloud engineer", "full stack"]
+    pages: 3
+
+  # ---------------- Greenhouse (added Oct 5) ----------------
+  # Slugs verified against boards-api.greenhouse.io.
+  - name: SeatGeek
+    ats: greenhouse
+    slug: seatgeek
+    location_regex: "United States|USA|Remote|New York|, [A-Z]{2}\\b"
+
+  - name: Squarespace
+    ats: greenhouse
+    slug: squarespace
+    location_regex: "United States|USA|Remote|New York|Portland|, [A-Z]{2}\\b"
+
+  - name: xAI
+    ats: greenhouse
+    slug: xai
+    location_regex: "Austin|New York|Palo Alto|San Francisco|Seattle|Washington|Memphis|Southaven|Los Angeles|Bastrop|Remote.*US|United States"
+
+  - name: MNTN
+    ats: greenhouse
+    slug: mntn
+    location_regex: "United States|USA|Remote|Austin|New York|Los Angeles|, [A-Z]{2}\\b"
+
+  # ---------------- Radancy ----------------
+  - name: Barclays
+    ats: radancy
+    base_url: "https://search.jobs.barclays"
+    search_url: "https://search.jobs.barclays/search-jobs/Software/United%20States/13015/1/2/6252001/39x76/-98x5/50/2"
+    query:
+      Keywords: "software"
+      Location: "United States"
+      Distance: 100
+      RadiusUnitType: 0
+      ShowRadius: "False"
+      SearchType: 5
+    pages: 3
+    location_regex: "United States|USA|, [A-Z]{2}\\b|New York|New Jersey|Whippany|Wilmington|Florham"
+
+  # ---------------- Not wired up yet (need one request captured from the site) ----------------
+  # - name: Deutsche Bank      # careers.db.com - custom front end
+  # - name: UBS                # jobs.ubs.com - IBM Kenexa BrassRing
