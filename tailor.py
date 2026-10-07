@@ -40,6 +40,7 @@ import sqlite3
 import statistics
 import sys
 import textwrap
+import time
 from datetime import datetime
 
 import requests
@@ -322,14 +323,41 @@ bullets in a row never start with the same verb.
 recruiter score is computed separately, from the exact words."""
 
 
-def _api_call(body, key, timeout=180):
-    r = requests.post("https://api.anthropic.com/v1/messages",
-                      headers={"x-api-key": key, "anthropic-version": "2023-06-01",
-                               "content-type": "application/json"},
-                      json=body, timeout=timeout)
-    if r.status_code >= 300:
-        raise RuntimeError(f"Claude API {r.status_code}: {r.text[:400]}")
-    return r.json()
+# Worth a second try: a dropped or garbled connection (SSLV3_ALERT_BAD_RECORD_MAC), a
+# rate limit, an overload (529) or an upstream hiccup. A bad key or request is not, and
+# neither is a read timeout - waiting another 180s would only stall the cycle.
+RETRY_STATUS = {429, 500, 502, 503, 504, 529}
+API_ATTEMPTS = 3
+
+
+def _api_call(body: dict, key: str, timeout: int = 180) -> dict:
+    for attempt in range(1, API_ATTEMPTS + 1):
+        try:
+            r = requests.post("https://api.anthropic.com/v1/messages",
+                              headers={"x-api-key": key, "anthropic-version": "2023-06-01",
+                                       "content-type": "application/json"},
+                              json=body, timeout=timeout)
+        except requests.ConnectionError as e:     # includes SSLError and ConnectTimeout
+            if attempt == API_ATTEMPTS:
+                raise
+            wait, why = 2.0 ** attempt, type(e).__name__
+        else:
+            if r.status_code < 300:
+                return r.json()
+            if r.status_code not in RETRY_STATUS or attempt == API_ATTEMPTS:
+                raise RuntimeError(f"Claude API {r.status_code}: {r.text[:400]}")
+            wait, why = _retry_after(r, attempt), f"HTTP {r.status_code}"
+        log.warning("Claude API %s - retry %d of %d in %.0fs", why, attempt,
+                    API_ATTEMPTS - 1, wait)
+        time.sleep(wait)
+
+
+def _retry_after(r, attempt: int) -> float:
+    """The server's retry-after when it sends one (capped), else 2s, 4s, ..."""
+    try:
+        return min(float(r.headers.get("retry-after")), 30.0)
+    except (TypeError, ValueError):
+        return 2.0 ** attempt
 
 
 def _text_of(payload):

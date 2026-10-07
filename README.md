@@ -173,13 +173,18 @@ python tailor.py --scores        # distribution + how many alerts each bar would
 ```
 
 Below the bar no resume is written and nothing reaches Discord, but the score and the
-gaps are still recorded — a weak match is exactly where the gap list earns its keep.
+gaps are still recorded — a weak match is exactly where the gap list earns its keep. A
+match that clears it sends one "Resume ready" card, which links the posting.
 
 **This costs alert speed.** Each new match waits on one API call (~20–45s with Sonnet,
-less with Haiku). `max_per_cycle` caps how many are scored per poll; the rest are picked
-up next cycle. Delete `min_match_score` to alert the moment a title matches. Scoring is
-skipped — and everything alerts unscored — when tailoring is off or `ANTHROPIC_API_KEY`
-is missing, so a misconfiguration can never silently swallow every alert.
+less with Haiku). `max_per_cycle` caps how many are scored before the alert step; the
+rest are scored by the tailor step at the end of the cycle (or the next) and, like the
+others, reach Discord only if they clear the bar. A dropped connection, a rate limit or
+an overload is retried twice before a call counts as failed. Delete `min_match_score` to
+alert the moment a title matches. Scoring is skipped — and everything alerts unscored —
+when tailoring is off or `ANTHROPIC_API_KEY` is missing, so a misconfiguration can never
+silently swallow every alert. For the same reason a match whose description can't be
+fetched, or whose scoring call still fails, alerts unscored rather than vanishing.
 
 ### What only you can fix
 

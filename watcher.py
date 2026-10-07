@@ -1031,7 +1031,9 @@ def poll_once(cfg, con, tfilter, notifier=None):
                     skipped += 1
                     reasons[reason] = reasons.get(reason, 0) + 1
                 elif score_gate:
-                    to_score.append((name, job))        # alerts after scoring, below
+                    # With the JD attached, so the scorer can judge it: without one,
+                    # tailor_job skips the posting and it would alert unscored.
+                    to_score.append((name, dict(job, description=desc)))
                 else:
                     notifier.add(job, name)
                     alerted = 0
@@ -1110,17 +1112,19 @@ def score_then_alert(cfg, con, notifier, queued, min_score):
         con.execute("UPDATE jobs SET tailored=?, match_score=? WHERE company=? AND job_id=?",
                     (mark, res.get("score"), company, job["job_id"]))
         if res.get("passed"):
-            enriched = dict(job)
-            enriched["summary"] = (f"**Recruiter {res['score']}/100** · "
-                                   f"{(res['plan'].get('role_summary') or '')}")[:400]
-            notifier.add(enriched, company)
+            # One message per resume: the card links the posting and carries the score.
             tailor.notify_discord(row, res["plan"], res["folder"])
     if len(queued) > cap:
         over = queued[cap:]
-        log.info("%d match(es) past max_per_cycle - left unscored, retried next cycle",
-                 len(over))
-        con.executemany("UPDATE jobs SET notified=0 WHERE company=? AND job_id=?",
-                        [(c, j["job_id"]) for c, j in over])
+        # The tailor step scores the rest from the stored JD, this cycle or the next, and
+        # alerts only those that clear the bar. A posting with no JD can never be scored,
+        # so it is flagged undelivered and alerts unscored next cycle instead of vanishing.
+        unscoreable = [(c, j["job_id"]) for c, j in over
+                       if not (j.get("description") or "").strip()]
+        log.info("%d match(es) past max_per_cycle - left to the tailor step%s", len(over),
+                 f" ({len(unscoreable)} with no description will alert unscored)"
+                 if unscoreable else "")
+        con.executemany("UPDATE jobs SET notified=0 WHERE company=? AND job_id=?", unscoreable)
     con.commit()
 
 
