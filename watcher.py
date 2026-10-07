@@ -1111,7 +1111,7 @@ def score_then_alert(cfg, con, notifier, queued, min_score):
                     (mark, res.get("score"), company, job["job_id"]))
         if res.get("passed"):
             enriched = dict(job)
-            enriched["summary"] = (f"**Match {res['score']}/100** · "
+            enriched["summary"] = (f"**Recruiter {res['score']}/100** · "
                                    f"{(res['plan'].get('role_summary') or '')}")[:400]
             notifier.add(enriched, company)
             tailor.notify_discord(row, res["plan"], res["folder"])

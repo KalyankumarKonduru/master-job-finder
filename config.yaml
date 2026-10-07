@@ -15,10 +15,14 @@ on_unknown_sponsorship: alert   # 'alert' keeps unclear postings; 'skip' drops t
 # and nice-to-have sections are ignored. Leave blank to turn the screen off.
 max_years_experience: 5
 
-# Only alert, and only build a resume, when the posting scores at least this against
-# your bullet bank. Scoring costs one API call per new match, so alerts now wait on
-# that call - see "Score gate" in the README. Remove this line to alert on everything.
-min_match_score: 65          # boards fetched concurrently
+# Only alert, and only build a resume, when the RECRUITER score clears this bar: the
+# share of the posting's required terms that appear in its own words inside a job
+# bullet. SKILLS and Key Achievements mentions don't count - they name no employer.
+# Claude's semantic score is kept in the report for context and never gates.
+# Literal scores run lower than the old semantic ones, so after a day of postings run
+# `python tailor.py --scores` and set this from the distribution. Scoring costs one
+# API call per new match. Remove this line to alert on everything.
+min_match_score: 65
 
 # Title filters are regexes matched against a NORMALIZED title:
 # lowercase, "sr." -> "senior", "full-stack"/"fullstack" -> "full stack", punctuation -> spaces.
@@ -68,10 +72,17 @@ tailor:
   max_tokens: 16000             # reasoning tokens count against this; unused ceiling costs nothing
   model: claude-haiku-4-5-20251001        #  claude-sonnet-5 is cheaper/faster
   max_per_cycle: 5              # cap postings SCORED per poll; the rest wait a cycle
-  only_new: true                # tailor only jobs found in THIS cycle. false makes every
-                                # cycle also chew through the backlog of older matches.
+  only_new: true                # tailor only jobs first seen since the watcher started;
+                                # false makes every cycle chew through the old backlog too.
   compact: true                 # tighten margins and paragraph gaps to fit one page
   line_spacing: 1            # applied to every paragraph, overriding template styles
+  proof_includes_achievements: false   # Key Achievements names no employer, so a
+                                # recruiter reads it as a claim. true lets a term
+                                # proven only there count toward the score.
+  max_verb_uses: 2              # per generated resume: an opening verb (Built, Added,
+                                # Covered...) starts at most this many bullets, two in a
+                                # row never share one, and no claim prints twice.
+                                # Master templates are never changed by this.
   output_dir: applications
   page_budget:
     achievements: 5             # the one fixed block

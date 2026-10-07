@@ -143,23 +143,59 @@ If a reply still isn't JSON, the call is retried once with a bigger budget and t
 contract restated as a follow-up user turn. If that fails too, both raw responses land
 in `applications/_debug/` and the error says what came back.
 
-### Score gate
+### Score gate — the recruiter's reading
 
-`min_match_score: 65` means a posting must score at least 65 against the bullet bank
-before it alerts **or** gets a resume. Below the bar nothing is written and nothing
-reaches Discord — but the score and the keyword gaps are still recorded, because a weak
-match is exactly where the gap list earns its keep.
+The first person reading a resume is a recruiter, and a recruiter reads literally. A
+requirement only counts as a qualification when the posting's **own words** appear in a
+bullet that sits **inside a job**. A SKILLS line or a summary names no employer, so
+anything that lives only there reads as a claim. Nothing is inferred: TypeScript does
+not prove JavaScript, cloud does not prove AWS.
 
-**This costs alert speed.** The score does not exist until the job description has been
-compared against all 170 bullets, so each new match now waits on one API call
-(~20–45s with Sonnet, less with Haiku). `max_per_cycle` caps how many are scored per
-poll; anything past the cap stays `notified=0` and is picked up next cycle. Delete
-`min_match_score` from the config to go back to alerting the moment a title matches.
+The tailor scores every posting that way:
 
-Alerts that do go out carry the score, and the resume lands in `applications/` at the
-same time. Scoring is skipped — and everything alerts unscored — when tailoring is off
-or `ANTHROPIC_API_KEY` is missing, so a misconfiguration can never silently swallow
-every alert.
+1. Claude copies the posting's required terms **verbatim**, most central first, and
+   separates out what no bullet can say word-for-word (years, degrees, certifications).
+   Any "required term" not literally in the job description is discarded.
+2. Claude proposes a selection; the code then **repairs coverage** inside the page
+   budget — for each required term the page doesn't prove yet, it swaps in a bullet
+   from your bank that says it, without dropping anything already proven.
+3. Each block is **ordered** so bullets carrying the most-asked-for terms print first —
+   the first bullet of your most recent job is the most-read line on the page.
+4. The **recruiter score** is the share of required terms proven in the posting's words
+   inside a job. It alone decides whether a resume is written and an alert sent.
+   Claude's semantic score is kept in the report for context and never gates.
+
+`min_match_score: 65` is that recruiter-score bar. Literal scores run lower than the old
+semantic ones, so once postings have accumulated, set the bar from data:
+
+```
+python tailor.py --scores        # distribution + how many alerts each bar would send
+```
+
+Below the bar no resume is written and nothing reaches Discord, but the score and the
+gaps are still recorded — a weak match is exactly where the gap list earns its keep.
+
+**This costs alert speed.** Each new match waits on one API call (~20–45s with Sonnet,
+less with Haiku). `max_per_cycle` caps how many are scored per poll; the rest are picked
+up next cycle. Delete `min_match_score` to alert the moment a title matches. Scoring is
+skipped — and everything alerts unscored — when tailoring is off or `ANTHROPIC_API_KEY`
+is missing, so a misconfiguration can never silently swallow every alert.
+
+### What only you can fix
+
+The code can enforce *what* (their words) and *where* (inside a job). It cannot supply
+*how* you used something, *why* it mattered in plain English, or a number with real
+scale — those are facts only you have, and the tailor never rewrites a bullet.
+
+```
+python tailor.py --audit         # writes applications/_gaps/BANK_AUDIT.md
+```
+
+lists every bullet with no plain-English reason, a percentage with nothing behind it, or
+a verb that would be true of a different job — most-printed bullets first, so the
+rewrites that reach the most recruiters come first. A passing bullet reads like:
+*Built REST APIs in Python with FastAPI, PostgreSQL and AWS so customers could schedule
+their own email briefings instead of asking our team to pull the data by hand.*
 
 ### Keyword gaps
 
@@ -181,9 +217,11 @@ usually map to, and links an example role. Nothing is written into your template
 file tells you which real experience is costing you the most matches, and which bullets
 are worth writing yourself if the experience exists and the bank just never captured it.
 
-`match_report.md` gives the score, the keywords genuinely covered, and — the part
-worth reading — the gaps: required keywords nothing in your bank evidences. Those
-are not filled in. They tell you whether to apply or to go build that experience.
+`match_report.md` gives the recruiter score, each proven term with the job and bullet
+that proves it, a first-bullet check, claims with no proof (SKILLS or Key Achievements
+only), **page gaps** (your bank says it, but it didn't fit this page) and **bank gaps**
+(no bullet anywhere says it). Only bank gaps pool into `KEYWORD_GAPS.md` — those are the
+ones to write, in the posting's own words, wherever the experience is real.
 
 ### Tuning
 

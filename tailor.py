@@ -8,25 +8,36 @@ bullets that already exist in your master templates.
   python tailor.py --url <job url>        # tailor any posting, even one not in the DB
   python tailor.py --jd-file jd.txt       # tailor from a pasted JD saved to a file
   python tailor.py --list                 # matched jobs and their tailor status
+  python tailor.py --fit                  # one-page budget and the geometry behind it
+  python tailor.py --audit                # bullets missing a WHY, real scale, or a concrete verb
+  python tailor.py --scores               # recruiter vs semantic scores, to tune the bar
 
 Output per job, under ./applications/<Company>__<Title>__<id>/ :
   <NAME>_<Company>.docx   the tailored resume
-  match_report.md         score, matched keywords, gaps, and which bullets were used
+  match_report.md         recruiter score, proof per term, gaps, and the bullets used
   job_description.txt     the JD it was built from
+  plan.json               Claude's full answer plus the scoring, for re-scoring later
 
 How the resume is produced:
-  Claude reads the JD and CHOOSES bullet IDs from your bank. It never writes bullet
-  text. Any ID it returns that isn't in the bank is discarded. The .docx is your own
-  template with unselected paragraphs removed, so formatting and wording are yours.
+  Claude reads the JD, copies its required terms VERBATIM, and CHOOSES bullet IDs
+  from your bank. It never writes bullet text. The code then scores the page the way
+  a recruiter reads it: a term counts only when its exact words appear in a bullet
+  under a job - never from the SKILLS line or a summary. Coverage is repaired inside
+  the page budget and the most-asked-for terms are printed first. That recruiter
+  score gates the alert; Claude's own semantic score is kept for context only.
+  The .docx is your own template with unselected paragraphs removed, so formatting
+  and wording are yours.
 
 Env: ANTHROPIC_API_KEY (required), DISCORD_WEBHOOK_URL / TELEGRAM_* (optional)
 """
 import argparse
+import glob
 import json
 import logging
 import os
 import re
 import sqlite3
+import statistics
 import sys
 import textwrap
 from datetime import datetime
@@ -50,13 +61,15 @@ MAX_TOKENS = 16000
 # The defaults below sum to 26, so they intentionally allow a second page; drop to
 # 4/6/5/4 to force one. Override in config.yaml under `tailor: page_budget:` - and
 # re-check the rendered page count whenever you raise these or change line_spacing.
-# A block's cap is enforced in assemble() after Claude has already scored its
-# selection, which is why verify_resume() re-scores the bullets that survive.
+# Caps are enforced in select_blocks(), and repair_coverage() works inside them, so
+# the recruiter score is always computed on exactly what the page will print.
 PAGE_BUDGET = {}            # resolved per run - see resolve_budget()
 ACHIEVEMENTS_CAP = 5        # the one fixed block
 JOB_BULLETS = "auto"        # "auto" = fit the page; an int pins the first job at n
 PAGE_LINES = None           # override the estimated lines per page
 EXPLICIT_BLOCKS = set()     # blocks pinned by name in config.yaml, never auto-fitted
+PROOF_INCLUDES_ACHIEVEMENTS = False  # Key Achievements names no employer, so no WHERE
+MAX_VERB_USES = 2           # how many bullets one opening verb may start, page-wide
 DEFAULT_JOB_BUDGET = 5
 COMPACT = True
 LINE_SPACING = 1.15
@@ -65,7 +78,7 @@ LINE_SPACING = 1.15
 def apply_config(cfg):
     """Let config.yaml override the budget, model and compact layout."""
     global PAGE_BUDGET, DEFAULT_JOB_BUDGET, COMPACT, OUT_DIR, MAX_TOKENS, LINE_SPACING
-    global ACHIEVEMENTS_CAP, JOB_BULLETS, PAGE_LINES, EXPLICIT_BLOCKS
+    global ACHIEVEMENTS_CAP, JOB_BULLETS, PAGE_LINES, EXPLICIT_BLOCKS, PROOF_INCLUDES_ACHIEVEMENTS, MAX_VERB_USES
     t = (cfg or {}).get("tailor") or {}
     pb = {str(k).lower(): v for k, v in (t.get("page_budget") or {}).items()}
     ACHIEVEMENTS_CAP = int(pb.pop("achievements", ACHIEVEMENTS_CAP))
@@ -73,6 +86,9 @@ def apply_config(cfg):
     pl = pb.pop("page_lines", None)
     PAGE_LINES = int(pl) if pl else None
     EXPLICIT_BLOCKS = set(pb)          # a block named outright still wins
+    PROOF_INCLUDES_ACHIEVEMENTS = bool(t.get("proof_includes_achievements",
+                                             PROOF_INCLUDES_ACHIEVEMENTS))
+    MAX_VERB_USES = max(1, int(t.get("max_verb_uses", MAX_VERB_USES)))
     PAGE_BUDGET.update({k: int(v) for k, v in pb.items()})
     DEFAULT_JOB_BUDGET = int(t.get("default_job_budget", DEFAULT_JOB_BUDGET))
     COMPACT = bool(t.get("compact", COMPACT))
@@ -249,6 +265,11 @@ def budget_for(tpl, n, achievements=5, floor=1):
 SYSTEM = """You tailor a resume by SELECTING pre-written bullets. You never write, \
 edit, paraphrase or invent bullet text — you only choose ids from the bank you are given.
 
+The first reader is a recruiter, not an engineer, and a recruiter reads literally. A \
+requirement only counts when the posting's EXACT words appear in a bullet that sits under a \
+job. Nothing is inferred on the candidate's behalf: TypeScript does not prove JavaScript, \
+Pydantic does not prove Python, cloud does not prove AWS, GitHub Actions does not prove CI/CD.
+
 You are given a job description and a bank of bullets, grouped into blocks. Every bullet \
 belongs to exactly one block (the key achievements block, or one employer). Bullets carry \
 a template tag (backend / cloud_devops / frontend / fullstack); you may mix tags freely \
@@ -259,26 +280,46 @@ Return ONLY a JSON object, no prose, no code fences:
   "base_template": "backend|cloud_devops|frontend|fullstack",
   "base_reason": "one sentence on why this template's skills section and framing fit best",
   "role_summary": "one sentence on what this job actually is",
-  "must_have_keywords": ["the concrete skills/tools/practices the posting requires"],
+  "required_terms": ["the posting's exact words for each required skill, most central first"],
+  "preferred_terms": ["the posting's exact words for each preferred / nice-to-have skill"],
+  "meta_requirements": ["requirements no bullet can say word-for-word: years, degrees, certs"],
   "selected": {"<block name>": ["<bullet id>", ...]},
   "selection_notes": "one or two sentences on the ordering logic",
-  "extra_skill_terms": ["skill terms to append to the base template's SKILLS line"],
-  "matched_keywords": ["required keywords genuinely evidenced by the selected bullets"],
-  "missing_keywords": ["required keywords NOT evidenced anywhere in the bank"],
-  "match_score": 0-100,
+  "semantic_score": 0-100,
   "fit_assessment": "2-3 sentences: is this worth applying to, and what is the weakest point"
 }
 
-Rules:
-- An id may ONLY be listed under the block it appears beneath in the bank. A bullet belongs to one employer; it cannot be moved to another. Listing backend:150 under a block other than its own is an error, not a reordering.
-- Respect each block's stated cap. Order ids strongest-match first; that is the order they print.
-- Prefer a bullet naming the exact tool in the posting over a generic one.
-- Avoid near-duplicate bullets; each one should add new evidence.
-- extra_skill_terms may ONLY contain terms that appear in the SKILLS lines you are shown.
-- match_score is the share of must_have_keywords truly covered by selected bullets. Be strict: \
-do not count a keyword as matched because it is adjacent or similar. An honest 60 is more \
-useful than an inflated 95.
-- missing_keywords drives the candidate's decision, so list every real gap."""
+Rules for the terms:
+- Copy every term VERBATIM from the posting, in its own wording: if it says "Spring Boot", \
+write "Spring Boot", not "Spring". One tool, language, platform or practice per entry. Never \
+paraphrase, generalise, translate or merge terms.
+- required_terms come from the required / basic / minimum qualifications. Order them by how \
+central the posting makes them: the first is what the role exists to do.
+- Anything that cannot appear word-for-word in a bullet goes in meta_requirements instead: \
+"5+ years of Java", "a degree in Computer Science", "two database technologies", \
+"US citizenship", "AWS certification".
+- A term is what a recruiter would type into search: usually 1-3 words, never a clause. When \
+the posting phrases a requirement as a long clause, take its searchable core in the posting's \
+own words and put the full clause in meta_requirements. "Hands-on experience using \
+enterprise-authorized AI-assisted software development tools" gives the term "AI-assisted".
+
+Rules for the selection:
+- An id may ONLY be listed under the block it appears beneath in the bank. A bullet belongs \
+to one employer; it cannot be moved to another. Listing backend:150 under a block other than \
+its own is an error, not a reordering.
+- Respect each block's stated cap, and use it: the page is sized to hold exactly that many \
+bullets, so fill every block unless nothing left in it relates to the posting.
+- Serve what was ordered first. A bullet containing a required term in the posting's own \
+words beats a more impressive bullet that contains none.
+- Order each block so the bullets carrying the most central required terms come first. The \
+FIRST bullet of the most recent job is the most-read line on the page: give it the \
+highest-priority terms.
+- Avoid near-duplicate bullets; each one should add new evidence. Never pick two bullets \
+that make the same claim with different numbers, in the same block or across blocks.
+- Vary the opening verbs: no verb may open more than 2 bullets on the whole page, and two \
+bullets in a row never start with the same verb.
+- semantic_score is your own engineer's estimate of fit. It is shown for context only; the \
+recruiter score is computed separately, from the exact words."""
 
 
 def _api_call(body, key, timeout=180):
@@ -365,70 +406,33 @@ def ask_claude(jd_text, title, company, bank, skills, model, max_tokens=None):
             raise ValueError(f"{second} (raw responses saved to {path})") from second
 
 
-# ---------------------------------------------------------------- assembly
-def assemble(plan, bank, templates, out_docx):
-    """Render the .docx. Returns (base, used, dropped) — `used` is block -> [texts]
-    in the order they appear in the document."""
-    base = next((t for t in templates if t.kind == plan.get("base_template")), templates[0])
-    blocks, used, dropped, rehomed = {}, {}, [], []
+# ---------------------------------------------------------------- the recruiter's reading
+# A recruiter is qualification hunting, and reads literally. A requirement counts only
+# when the posting's own words (WHAT) appear in a bullet that sits inside a job (WHERE).
+# Skills lines and summaries name no employer, so they are claims, never proof.
+#
+# Claude extracts the terms and proposes a selection; everything in this section is
+# deterministic. It decides what is proven, repairs coverage within the page budget,
+# orders the page so the most-asked-for terms come first, and computes the score the
+# alert is gated on. Nothing here writes or rewords a bullet.
 
-    # Pass 1 - resolve every id to its TRUE block. A bullet's block is a property of the
-    # master template: it is that employer's line, not a slot the model gets to choose.
-    # So an id listed under the wrong block is a misfile, and discarding it silently
-    # deletes evidence the score already counted. Re-home it instead.
-    chosen = {}
-    for block, ids in (plan.get("selected") or {}).items():
-        for bid in ids:
-            b = bank.get(bid)
-            if b is None:                       # invented id — nothing to place
-                dropped.append(f"{bid} (not in bank)")
-                continue
-            if b["block"] != block:
-                rehomed.append(f"{bid}: filed under '{block}', belongs to '{b['block']}'")
-            chosen.setdefault(b["block"], []).append(bid)
-
-    # Pass 2 - drop duplicate text, then apply each block's page_budget cap. Ids the
-    # model put in the block itself come first, so a re-homed bullet never displaces
-    # one that was chosen for that block deliberately.
-    for block, ids in chosen.items():
-        cap = PAGE_BUDGET.get(block, DEFAULT_JOB_BUDGET)
-        nodes, texts, seen = [], [], set()
-        for bid in ids:
-            b = bank[bid]
-            if b["text"] in seen:
-                dropped.append(f"{bid} (duplicate text)")
-                continue
-            if len(nodes) >= cap:
-                dropped.append(f"{bid} (over the {block} cap of {cap})")
-                continue
-            seen.add(b["text"])
-            nodes.append(b["tpl"].bullet_node(b["idx"]))
-            texts.append(f"{b['text']}   [{b['tpl'].kind}]")
-        blocks[block] = nodes
-        used[block] = texts
-
-    base.render(blocks, out_docx, skill_text=build_skill_text(base, plan.get("extra_skill_terms") or []),
-                compact=COMPACT, line_spacing=LINE_SPACING)
-    return base, used, dropped, rehomed
-
-
-def build_skill_text(base, extra_terms):
-    """Append JD-relevant terms to the base SKILLS lines, skipping ones already there."""
-    if not extra_terms:
-        return None
-    out = {}
-    existing = " | ".join(txt for _, txt in base.skill_lines).lower()
-    add = [t for t in extra_terms if t.lower() not in existing]
-    if not add:
-        return None
-    idx, txt = base.skill_lines[0]
-    label, _, rest = txt.partition(":")
-    out[idx] = f"{rest.strip()} | " + " | ".join(add)
-    return out
-
-
-# ---------------------------------------------------------------- final check
-TPL_TAG = re.compile(r"\s*\[(?:backend|cloud_devops|frontend|fullstack)\]\s*$")
+# Writing-quality signals, shared by selection tie-breaks and `--audit`: a plain-English
+# reason (WHY), a real count of something (scale), a percentage, a verb that proves nothing.
+WHY_RE = re.compile(r"\b(so that|so [\w/.-]+(?: [\w/.-]+){0,3} (?:could|can|got|get|saw|see|"
+                    r"had|have|would|stayed|stay|kept|keep|no longer|never|did|caught|found|"
+                    r"shipped|loaded|ran)|so customers|so users|so the|so teams?|enabling|"
+                    r"allowing|letting|instead of|without (?:having|needing)|for \d+[kK]? "
+                    r"(?:users|customers|employees|engineers|team)|used (?:daily )?by)\b", re.I)
+SCALE_RE = re.compile(r"\d[\d,.]*\s*(k|m|million|thousand)?\s*(users|customers|requests|"
+                      r"events|records|transactions|services|repos|engineers|team|members|"
+                      r"screens|apis|endpoints|per (?:day|second|week|month)|daily|weekly|"
+                      r"rps|qps|tb|gb|pb)\b", re.I)
+PCT_RE = re.compile(r"\d+%")
+# A verb is only vague when nothing concrete follows it: "Led a 4-person team" names
+# something checkable, "Led key initiatives" would be true of any job.
+VAGUE_RE = re.compile(r"^(led|drove|spearheaded|managed|oversaw|responsible|supported|helped|"
+                      r"worked on|participated|contributed|collaborated|involved)\b"
+                      r"(?!\s+(?:an?\s+|the\s+)?\d)", re.I)
 
 
 def _norm_text(s):
@@ -464,56 +468,538 @@ def _kw_present(kw, hay):
     return len(parts) > 1 and any(_term_present(p, hay) for p in parts)
 
 
-def verify_resume(plan, used, base, extra_terms, bank=None):
-    """Measure what `assemble` cost the resume, and adjust the score by that much.
+def _dedupe(items) -> list[str]:
+    """Strip, drop blanks and case-insensitive repeats, keep first-seen order."""
+    seen, out = set(), []
+    for item in items or []:
+        text = str(item).strip()
+        if text and text.lower() not in seen:
+            seen.add(text.lower())
+            out.append(text)
+    return out
 
-    `match_score` is Claude's estimate, made BEFORE the document exists, and it judges
-    evidence semantically - a Kafka consumer bullet can evidence "publish/subscribe"
-    without containing the words. `assemble` can then drop bullets the estimate counted:
-    an id missing from the bank, an id in the wrong block, duplicate text, or anything
-    past a block's page_budget cap.
 
-    Matching keywords literally is far too strict to use as an absolute score - phrases
-    like "two database technologies" or "on-call rotations" never appear verbatim in a
-    bullet. But it IS reliable as a *relative* measure between two sets of the same
-    bullets, so that is all it is used for here: literal coverage of the planned
-    selection versus literal coverage of what survived. Nothing dropped means the ratio
-    is 1 and the score is untouched. Lose half the keyword-bearing bullets and the score
-    halves. No API call: `assemble` already returns the surviving text.
+def normalize_plan(plan: dict) -> dict:
+    """Accept the older response shape too, so a model that still answers with
+    must_have_keywords / match_score is scored instead of rejected."""
+    if not plan.get("required_terms") and plan.get("must_have_keywords"):
+        plan["required_terms"] = plan["must_have_keywords"]
+    if plan.get("semantic_score") is None and plan.get("match_score") is not None:
+        plan["semantic_score"] = plan["match_score"]
+    for key in ("required_terms", "preferred_terms", "meta_requirements"):
+        plan[key] = _dedupe(plan.get(key))
+    return plan
+
+
+MAX_TERM_WORDS = 4   # "Software Development Life Cycle" is a real term; longer is a clause
+
+
+def split_long_terms(plan: dict) -> list[str]:
+    """Move any 'term' longer than MAX_TERM_WORDS words into meta_requirements.
+
+    Recruiters search for terms, not clauses. A phrase like "responsible AI use in
+    engineering workflows" can never appear word-for-word in a bullet, so scoring it is
+    a guaranteed miss that says nothing about the candidate. It is moved to the
+    check-by-eye list instead, and returned so the report can say what moved.
     """
-    must = [k for k in (plan.get("must_have_keywords") or []) if str(k).strip()]
-    planned = plan.get("match_score")
-    if not must:
+    moved = []
+    for key in ("required_terms", "preferred_terms"):
+        keep = []
+        for term in plan.get(key) or []:
+            (moved if len(str(term).split()) > MAX_TERM_WORDS else keep).append(term)
+        plan[key] = keep
+    plan["meta_requirements"] = _dedupe((plan.get("meta_requirements") or []) + moved)
+    return moved
+
+
+def validate_terms(plan: dict, jd: str) -> list[str]:
+    """Drop every term the posting does not literally contain; return what was dropped.
+
+    WHAT means the posting's own wording. A term the model paraphrased ('Spring' for
+    'Spring Boot') would score a match the recruiter never sees in the posting, so
+    anything not in the JD text is removed before it can count.
+    """
+    hay = _norm_text(jd)
+    dropped = []
+    for key in ("required_terms", "preferred_terms"):
+        kept = []
+        for term in plan.get(key) or []:
+            (kept if _kw_present(term, hay) else dropped).append(term)
+        plan[key] = kept
+    return dropped
+
+
+def pick_base(plan: dict, templates: list):
+    return next((t for t in templates if t.kind == plan.get("base_template")), templates[0])
+
+
+def block_order(base) -> list[str]:
+    """Blocks in the order they print: achievements, then jobs, most recent first."""
+    return ["achievements"] + [j["key"] for j in base.jobs]
+
+
+def proof_blocks(base) -> set[str]:
+    """Blocks whose bullets count as proof: the ones that sit inside a job."""
+    blocks = {j["key"] for j in base.jobs}
+    if PROOF_INCLUDES_ACHIEVEMENTS:
+        blocks.add("achievements")
+    return blocks
+
+
+def _hits(text: str, terms: list[str]) -> set[int]:
+    """Indexes of the terms this text states in their own words."""
+    hay = _norm_text(text)
+    return {i for i, t in enumerate(terms) if _kw_present(t, hay)}
+
+
+def select_blocks(plan: dict, bank: dict, base) -> tuple[dict, list[str], list[str]]:
+    """Resolve Claude's selection into {block: [ids]} in print order.
+
+    Pass 1 resolves every id to its TRUE block. A bullet's block is a property of the
+    master template - it is that employer's line, not a slot the model gets to choose -
+    so an id listed under the wrong block is a misfile, and discarding it would silently
+    delete evidence. It is re-homed instead.
+
+    Pass 2 drops duplicate text and applies each block's page_budget cap. Ids the model
+    put in a block itself come first, so a re-homed bullet never displaces one chosen
+    for that block deliberately. Every job block is present, even if empty, so coverage
+    repair can still fill a job the model left out.
+    """
+    dropped, rehomed, routed = [], [], {}
+    for block, ids in (plan.get("selected") or {}).items():
+        for bid in ids or []:
+            b = bank.get(bid)
+            if b is None:                       # invented id - nothing to place
+                dropped.append(f"{bid} (not in bank)")
+                continue
+            if b["block"] != block:
+                rehomed.append(f"{bid}: filed under '{block}', belongs to '{b['block']}'")
+            routed.setdefault(b["block"], []).append(bid)
+
+    chosen = {}
+    order = block_order(base)
+    for block in order + [b for b in routed if b not in order]:
+        cap = PAGE_BUDGET.get(block, DEFAULT_JOB_BUDGET)
+        ids, seen = [], set()
+        for bid in routed.get(block, []):
+            text = bank[bid]["text"]
+            if text in seen:
+                dropped.append(f"{bid} (duplicate text)")
+                continue
+            if len(ids) >= cap:
+                dropped.append(f"{bid} (over the {block} cap of {cap})")
+                continue
+            seen.add(text)
+            ids.append(bid)
+        chosen[block] = ids
+    return chosen, dropped, rehomed
+
+
+def repair_coverage(chosen: dict, bank: dict, terms: list[str], base) -> list[str]:
+    """Swap in bullets that prove required terms the selection left unproven.
+
+    The page has a fixed number of slots, so the most score per slot comes from making
+    each one prove something the posting asked for. For each unproven term, most central
+    first, the best bank bullet that says it is taken - most recent job first, then the
+    one proving the most still-unproven terms, then one with a plain-English reason,
+    then one with real scale. It is added if its block has room; otherwise it replaces
+    the lowest-ranked bullet in that block whose terms are all proven elsewhere.
+
+    Coverage only ever grows, no bullet changes employer, no cap is exceeded, and a term
+    no bullet anywhere states is left alone - that is a bank gap, not a selection one.
+    Returns one line per change, for the report.
+    """
+    if not terms:
+        return []
+    proof = proof_blocks(base)
+    rank = {key: i for i, key in enumerate(block_order(base))}
+    cache = {}
+
+    def hits(bid):
+        if bid not in cache:
+            cache[bid] = _hits(bank[bid]["text"], terms)
+        return cache[bid]
+
+    def proven(skip=None):
+        return set().union(*(hits(b) for blk in proof for b in chosen.get(blk, [])
+                             if b != skip))
+
+    changes = []
+    for i, term in enumerate(terms):
+        have = proven()
+        if i in have:
+            continue
+        selected = {b for ids in chosen.values() for b in ids}
+        on_page = {bank[b]["text"] for b in selected}
+        candidates = [bid for bid, b in bank.items()
+                      if b["block"] in proof and bid not in selected
+                      and b["text"] not in on_page and i in hits(bid)]
+        candidates.sort(key=lambda bid: (rank.get(bank[bid]["block"], len(rank)),
+                                         -len(hits(bid) - have),
+                                         not WHY_RE.search(bank[bid]["text"]),
+                                         not SCALE_RE.search(bank[bid]["text"]),
+                                         bid))
+        for cand in candidates:
+            block = bank[cand]["block"]
+            ids = chosen.setdefault(block, [])
+            if len(ids) < PAGE_BUDGET.get(block, DEFAULT_JOB_BUDGET):
+                ids.append(cand)
+                changes.append(f"added `{cand}` to {block} — proves *{term}*")
+                break
+            # lowest-ranked first: Claude ordered strongest-first
+            victim = next((v for v in reversed(ids) if not hits(v) - proven(skip=v)), None)
+            if victim:
+                ids[ids.index(victim)] = cand
+                changes.append(f"swapped `{victim}` for `{cand}` in {block} — proves "
+                               f"*{term}*, and `{victim}` proved nothing unique")
+                break
+    return changes
+
+
+def order_blocks(chosen: dict, bank: dict, terms: list[str]) -> dict:
+    """Serve what was ordered first.
+
+    Within each block, bullets carrying the most central required terms print first - a
+    term's weight falls with its position in the posting - then ones with a plain-English
+    reason, then ones with real scale, then Claude's own order. The first bullet of the
+    most recent job, the most-read line on the page, is therefore the strongest one.
+    """
+    n = len(terms)
+
+    def key(item):
+        pos, bid = item
+        text = bank[bid]["text"]
+        weight = sum(n - i for i in _hits(text, terms))
+        return (-weight, not WHY_RE.search(text), not SCALE_RE.search(text), pos)
+
+    return {block: [bid for _, bid in sorted(enumerate(ids), key=key)]
+            for block, ids in chosen.items()}
+
+
+# Words that carry no claim, ignored when comparing two bullets for repetition.
+_STOPWORDS = frozenset("a an the and or of to in on for with so by from at as into onto per "
+                       "each its it their they them that this one no not across via over "
+                       "under".split())
+
+
+def opening_verb(text: str) -> str:
+    """First word of a bullet, lowercased; hyphenated verbs stay whole (Load-tested)."""
+    m = re.match(r"[A-Za-z][A-Za-z-]*", str(text).strip())
+    return m.group(0).lower() if m else ""
+
+
+def _shape(text: str) -> frozenset:
+    """Content words with every number removed, so two bullets that differ only in
+    their numbers have the same shape."""
+    t = re.sub(r"\d[\d,.]*\s*[kmb]?\+?%?", " ", str(text).lower())
+    return frozenset(w for w in re.findall(r"[a-z][a-z+#/.-]*", t) if w not in _STOPWORDS)
+
+
+def near_duplicate(a: str, b: str) -> bool:
+    """The same claim twice on one page: one sentence with different numbers, or the
+    same work reworded. Bullets that also open with the same verb need less word
+    overlap to read as a repeat (0.4) than bullets that open differently (0.7).
+    Thresholds calibrated on the real bank: every same-verb pair above 0.4 was a repeat
+    ("Ran 6 services across AWS EC2, ECS and Lambda" / "Ran 25 services across ..."),
+    and the cross-verb pairs above 0.7 were rewordings ("Migrated 30 JavaScript
+    modules to TypeScript" / "Moved 150 JavaScript modules to TypeScript")."""
+    sa, sb = _shape(a), _shape(b)
+    overlap = len(sa & sb) / max(1, len(sa | sb))
+    return overlap >= (0.4 if opening_verb(a) == opening_verb(b) else 0.7) - 1e-9
+
+
+def enforce_variety(chosen: dict, bank: dict, terms: list[str], base) -> tuple[dict, list[str]]:
+    """Make the page read like one person wrote it.
+
+    Two rules, applied to the finished page only - the master templates are not
+    touched: no opening verb starts more than MAX_VERB_USES bullets, and no claim is
+    printed twice (an exact repeat, or the same sentence with different numbers).
+
+    Bullets are judged most-valuable first: jobs before Key Achievements, because only
+    job bullets count as proof, and within each block in printed order. Every bullet
+    that fits is accepted. Each one that breaks a rule is then replaced by the best
+    unused bullet from the same employer that fits and proves everything the page would
+    otherwise lose; if there is none it is dropped. A bullet that is the page's only
+    proof of a required term is never dropped: if its verb is at the cap, room is made
+    by retiring a lower-priority bullet with the same verb that proves nothing unique.
+    Only when that is impossible does it stay over the cap, because losing the
+    qualification costs more than a repeated verb.
+
+    Returns (new selection, one line per change for the report). Input is not modified.
+    """
+    proof = proof_blocks(base)
+    jobs_first = [j["key"] for j in base.jobs] + ["achievements"]
+    jobs_first += [b for b in chosen if b not in jobs_first]
+    n = len(terms)
+    cache = {}
+
+    def hits(bid):
+        if bid not in cache:
+            cache[bid] = _hits(bank[bid]["text"], terms)
+        return cache[bid]
+
+    kept, verbs = [], {}
+    final = {block: [] for block in chosen}
+
+    def fits(bid):
+        text = bank[bid]["text"]
+        return (verbs.get(opening_verb(text), 0) < MAX_VERB_USES
+                and not any(near_duplicate(text, bank[k]["text"]) for k in kept))
+
+    def accept(bid, block):
+        kept.append(bid)
+        final[block].append(bid)
+        v = opening_verb(bank[bid]["text"])
+        verbs[v] = verbs.get(v, 0) + 1
+
+    def why_not(bid):
+        text = bank[bid]["text"]
+        v = opening_verb(text)
+        if verbs.get(v, 0) >= MAX_VERB_USES:
+            return f"\"{v.capitalize()}\" already opens {MAX_VERB_USES} bullets"
+        twin = next(k for k in kept if near_duplicate(text, bank[k]["text"]))
+        return f"repeats `{twin}`"
+
+    # pass 1: everything that fits, in priority order
+    breaking = []
+    for block in jobs_first:
+        for bid in chosen.get(block, []):
+            if fits(bid):
+                accept(bid, block)
+            else:
+                breaking.append((block, bid, why_not(bid)))
+
+    def rank_key(c):
+        return (-sum(n - i for i in hits(c)), not WHY_RE.search(bank[c]["text"]),
+                not SCALE_RE.search(bank[c]["text"]), c)
+
+    def make_room(bid, need):
+        """`bid` is the page's only proof of `need` but its verb is at the cap. Free
+        the verb by retiring a lower-priority bullet that opens the same way and proves
+        nothing unique, swapping in another bullet from that bullet's employer."""
+        v = opening_verb(bank[bid]["text"])
+        if verbs.get(v, 0) < MAX_VERB_USES:
+            return None                       # the clash is a repeated claim, not the cap
+        for k in reversed([x for x in kept if opening_verb(bank[x]["text"]) == v]):
+            kb = bank[k]["block"]
+            others = set().union(*(hits(x) for blk in proof for x in final.get(blk, [])
+                                   if x != k))
+            if kb in proof and hits(k) - others - hits(bid):
+                continue                      # k is itself the only proof of something
+            kept.remove(k)
+            final[kb].remove(k)
+            verbs[v] -= 1
+            on_page = {bank[x]["text"] for x in kept} | {bank[bid]["text"]}
+            pool = sorted((c for c, b in bank.items()
+                           if b["block"] == kb and c not in (k, bid) and c not in kept
+                           and b["text"] not in on_page and opening_verb(b["text"]) != v
+                           and fits(c) and not near_duplicate(b["text"], bank[bid]["text"])),
+                          key=rank_key)
+            if pool:
+                accept(pool[0], kb)
+                return (f"replaced `{k}` with `{pool[0]}` in {kb} to make room for `{bid}`, the "
+                        f"only proof of {', '.join(terms[i] for i in sorted(need))}")
+            kept.append(k)                    # no stand-in for k: put it back
+            final[kb].append(k)
+            verbs[v] += 1
         return None
-    doc_hay = " || ".join(_norm_text(TPL_TAG.sub("", t))
-                          for items in used.values() for t in items)
-    plan_hay = doc_hay
-    if bank:                       # every bullet Claude chose, before caps and drops
-        chosen = [bank[i]["text"] for ids in (plan.get("selected") or {}).values()
-                  for i in ids if i in bank]
-        if chosen:
-            plan_hay = " || ".join(_norm_text(t) for t in chosen)
-    skills = _norm_text(" | ".join(txt for _, txt in base.skill_lines)
-                        + " | " + " | ".join(str(t) for t in extra_terms))
 
-    confirmed, skills_only, lost = [], [], []
-    for kw in must:
-        if _kw_present(kw, doc_hay):
-            confirmed.append(str(kw))
-        elif _kw_present(kw, skills):
-            skills_only.append(str(kw))
+    # pass 2: a stand-in for each bullet that broke a rule
+    changes = []
+    for block, bid, reason in breaking:
+        proven = set().union(*(hits(k) for blk in proof for k in final.get(blk, [])))
+        need = (hits(bid) - proven) if block in proof else set()
+        on_page = {bank[k]["text"] for k in kept}
+        pool = [c for c, b in bank.items()
+                if b["block"] == block and c not in kept and b["text"] not in on_page
+                and need <= hits(c) and fits(c)]
+        pool.sort(key=rank_key)
+        if pool:
+            accept(pool[0], block)
+            changes.append(f"replaced `{bid}` with `{pool[0]}` in {block} — {reason}")
+        elif need and (room := make_room(bid, need)):
+            accept(bid, block)
+            changes.append(room)
+        elif need:
+            accept(bid, block)
+            changes.append(f"kept `{bid}` in {block} although {reason}: it is the only proof "
+                           f"of {', '.join(terms[i] for i in sorted(need))}")
         else:
-            lost.append(str(kw))
-    in_plan = [str(k) for k in must if _kw_present(k, plan_hay)]
-    dropped_evidence = [k for k in in_plan if k not in confirmed]
+            changes.append(f"dropped `{bid}` from {block} — {reason}, and no other bullet "
+                           f"from that employer fits")
+    return final, changes
 
-    ratio = (len(confirmed) / len(in_plan)) if in_plan else 1.0
-    final = planned if planned is None else int(round(planned * ratio))
-    return {"final_score": final, "planned": planned, "ratio": ratio,
-            "confirmed": confirmed, "skills_only": skills_only, "lost": lost,
-            "dropped_evidence": dropped_evidence,
-            "coverage_doc": len(confirmed), "coverage_plan": len(in_plan),
-            "bullets": sum(len(v) for v in used.values()), "must_total": len(must)}
+
+def separate_repeats(chosen: dict, bank: dict) -> dict:
+    """Two bullets in a row never open with the same verb. The first bullet of every
+    block stays put - it is the most-read line. For the second of a pair, the nearest
+    bullet below with a different verb is pulled up between them; when the pair ends
+    the block and there is nothing below, the repeat moves up instead, to the latest
+    earlier gap whose neighbours both open differently."""
+    out = {}
+    for block, ids in chosen.items():
+        ids = list(ids)
+
+        def verb(b):
+            return opening_verb(bank[b]["text"])
+
+        for i in range(1, len(ids)):
+            v = verb(ids[i])
+            if v != verb(ids[i - 1]):
+                continue
+            j = next((k for k in range(i + 1, len(ids)) if verb(ids[k]) != v), None)
+            if j is not None:
+                ids.insert(i, ids.pop(j))
+                continue
+            moving = ids.pop(i)
+            spot = next((p for p in range(i - 1, 0, -1)
+                         if verb(ids[p - 1]) != v and verb(ids[p]) != v), None)
+            ids.insert(i if spot is None else spot, moving)
+        out[block] = ids
+    return out
+
+
+def fill_page(chosen: dict, bank: dict, plan: dict, base) -> tuple[dict, list[str]]:
+    """Top every block up to its page_budget cap.
+
+    Claude often picks fewer bullets than the page holds - 22 of 35 on one live run -
+    and an empty slot proves nothing. Each block is filled, most recent job first, from
+    that employer's unused bullets ranked by what the posting asked for: required terms
+    (the most central weighted highest), then preferred terms, then a plain-English
+    reason and real scale. A filler obeys the same variety rules as every other bullet:
+    its opening verb is under MAX_VERB_USES and it repeats no claim already on the page.
+    A bullet that relates to nothing in the posting is only used if it comes from the
+    base template, so a Java role is never padded with iOS work.
+
+    Returns (new selection, one line per added bullet). Input is not modified.
+    """
+    required = plan.get("required_terms") or []
+    preferred = plan.get("preferred_terms") or []
+    n = len(required)
+    final = {block: list(ids) for block, ids in chosen.items()}
+    on_page = [b for ids in final.values() for b in ids]
+    verbs = {}
+    for b in on_page:
+        v = opening_verb(bank[b]["text"])
+        verbs[v] = verbs.get(v, 0) + 1
+
+    def rank(bid):
+        text = bank[bid]["text"]
+        req = sum(n - i for i in _hits(text, required))
+        pref = len(_hits(text, preferred))
+        return (-req, -pref, bank[bid]["tpl"].kind != base.kind,
+                not WHY_RE.search(text), not SCALE_RE.search(text), bid)
+
+    added = []
+    order = [j["key"] for j in base.jobs] + ["achievements"]
+    for block in order + [b for b in final if b not in order]:
+        cap = PAGE_BUDGET.get(block, DEFAULT_JOB_BUDGET)
+        if len(final.setdefault(block, [])) >= cap:
+            continue
+        texts = {bank[b]["text"] for b in on_page}
+        pool = sorted((bid for bid, b in bank.items()
+                       if b["block"] == block and bid not in on_page and b["text"] not in texts),
+                      key=rank)
+        for bid in pool:
+            if len(final[block]) >= cap:
+                break
+            text = bank[bid]["text"]
+            r = rank(bid)
+            if r[0] == 0 and r[1] == 0 and bank[bid]["tpl"].kind != base.kind:
+                continue                      # unrelated to the posting and off-template
+            v = opening_verb(text)
+            if verbs.get(v, 0) >= MAX_VERB_USES:
+                continue
+            if any(near_duplicate(text, bank[k]["text"]) for k in on_page):
+                continue
+            final[block].append(bid)
+            on_page.append(bid)
+            verbs[v] = verbs.get(v, 0) + 1
+            proves = [required[i] for i in sorted(_hits(text, required))]
+            added.append(f"filled {block} with `{bid}`"
+                         + (f" — says {', '.join(proves)}" if proves else ""))
+    return final, added
+
+
+def recruiter_score(plan: dict, chosen: dict, bank: dict, base) -> dict:
+    """What a recruiter would count as proven, and the score the alert is gated on.
+
+    score = required terms stated in the posting's own words inside a job bullet, over
+    required terms. A mention only in the SKILLS line or in Key Achievements is reported
+    as a claim: neither names an employer, so neither counts (achievements can be made
+    to count with tailor.proof_includes_achievements).
+    """
+    required = plan.get("required_terms") or []
+    preferred = plan.get("preferred_terms") or []
+    proof = proof_blocks(base)
+
+    def where(terms, blocks):
+        found = {}
+        for block in block_order(base):
+            if block not in blocks:
+                continue
+            for pos, bid in enumerate(chosen.get(block, []), 1):
+                hay = _norm_text(bank[bid]["text"])
+                for t in terms:
+                    if t not in found and _kw_present(t, hay):
+                        found[t] = [block.title(), pos]
+        return found
+
+    proven = where(required, proof)
+    proven_pref = where(preferred, proof)
+    in_achievements = {} if "achievements" in proof else where(required, {"achievements"})
+    skills = _norm_text(" | ".join(txt for _, txt in base.skill_lines))
+    bank_text = [_norm_text(b["text"]) for b in bank.values() if b["block"] in proof]
+    in_bank = {t for t in required if any(_kw_present(t, h) for h in bank_text)}
+
+    return {
+        "score": int(round(100 * len(proven) / len(required))) if required else None,
+        "required": len(required),
+        "proven": proven,
+        "proven_preferred": proven_pref,
+        "preferred_unproven": [t for t in preferred if t not in proven_pref],
+        "claims_skills": [t for t in required if t not in proven and _kw_present(t, skills)],
+        "claims_achievements": [t for t in required if t not in proven and t in in_achievements],
+        "page_gaps": [t for t in required if t not in proven and t in in_bank],
+        "bank_gaps": [t for t in required if t not in in_bank],
+        # SKILLS may only repeat what a bullet below it proves
+        "padding": [t for t in required + preferred
+                    if (t in proven or t in proven_pref) and not _kw_present(t, skills)],
+    }
+
+
+def used_texts(chosen: dict, bank: dict) -> dict:
+    """{block: [bullet text + template tag]} for the report, in print order."""
+    return {block: [f"{bank[bid]['text']}   [{bank[bid]['tpl'].kind}]" for bid in ids]
+            for block, ids in chosen.items() if ids}
+
+
+def render_resume(base, chosen: dict, bank: dict, out_docx: str, padding: list[str]) -> None:
+    """Write the .docx: the base template with exactly `chosen` as its bullets."""
+    blocks = {block: [bank[bid]["tpl"].bullet_node(bank[bid]["idx"]) for bid in ids]
+              for block, ids in chosen.items()}
+    # padding repeats the posting's words, which can arrive lowercase ("testing");
+    # capitalise those so they sit naturally beside "Security" and "Java"
+    padding = [t[:1].upper() + t[1:] if t.islower() else t for t in padding]
+    base.render(blocks, out_docx, skill_text=build_skill_text(base, padding),
+                compact=COMPACT, line_spacing=LINE_SPACING)
+
+
+def build_skill_text(base, extra_terms):
+    """Append terms to the base SKILLS line, skipping ones already there. Callers pass
+    only terms a selected bullet proves, so the line never claims what the page can't
+    back up."""
+    if not extra_terms:
+        return None
+    out = {}
+    existing = " | ".join(txt for _, txt in base.skill_lines).lower()
+    add = [t for t in extra_terms if t.lower() not in existing]
+    if not add:
+        return None
+    idx, txt = base.skill_lines[0]
+    label, _, rest = txt.partition(":")
+    out[idx] = f"{rest.strip()} | " + " | ".join(add)
+    return out
 
 
 # ---------------------------------------------------------------- keyword gaps
@@ -600,57 +1086,96 @@ def _render_gap_report(data, md_path):
 
 
 # ---------------------------------------------------------------- report
-def write_report(path, job, plan, used, dropped, base, rehomed=None):
-    chk = plan.get("verified") or {}
-    planned = plan.get("match_score")
-    score = chk.get("final_score", planned)
+def _bullet_line(text: str) -> str:
+    """Report text of a bullet, without the trailing template tag."""
+    return re.sub(r"\s+\[[a-z_]+\]\s*$", "", text)
+
+
+def write_report(path, job, plan, used, dropped, base, rehomed=None, swaps=None, variety=None,
+                 filled=None):
+    rs = plan.get("recruiter") or {}
+    score = rs.get("score")
+    required = plan.get("required_terms") or []
+    proven = rs.get("proven") or {}
     bar = "#" * int(round((score or 0) / 5)) + "." * (20 - int(round((score or 0) / 5)))
     lines = [
         f"# {job['title']}", f"**{job['company']}** · {job.get('location') or 'n/a'}",
         f"{job.get('url') or ''}", "",
-        f"## Match: {score}/100  `{bar}`", "",
+        f"## Recruiter score: {score}/100  `{bar}`", "",
+        f"**{len(proven)} of {len(required)}** required terms appear in the posting's own "
+        f"words inside a job — the only place a recruiter counts them.", "",
+        f"_Semantic fit (Claude's engineering read, context only — never gates the alert): "
+        f"{plan.get('semantic_score', '?')}/100_", "",
+        f"**Base template:** {base.kind}  — {plan.get('base_reason', '')}", "",
+        f"**Role:** {plan.get('role_summary', '')}", "",
+        f"**Verdict:** {plan.get('fit_assessment', '')}", "",
+        "## Proven — their words, inside a job", "",
     ]
-    if chk and chk.get("dropped_evidence"):
-        lines += [f"> Planned **{planned}/100**, reduced to **{chk['final_score']}/100**: "
-                  f"assembly cut bullets that were the only evidence for "
-                  f"{', '.join(chk['dropped_evidence'])}.", ""]
-    lines += [
-        f"**Base template:** {base.kind}  — {plan.get('base_reason','')}", "",
-        f"**Role:** {plan.get('role_summary','')}", "",
-        f"**Verdict:** {plan.get('fit_assessment','')}", "",
-        "## Keywords covered", "",
-        ", ".join(plan.get("matched_keywords") or []) or "_none_", "",
-        "## Gaps — nothing in your templates evidences these", "",
-    ]
-    miss = plan.get("missing_keywords") or []
-    lines += (["\n".join(f"- {m}" for m in miss)] if miss else ["_none_"])
-    if chk:
-        lines += ["", "## Final check against the job description", ""]
-        if chk.get("dropped_evidence"):
-            lines += [f"`assemble` wrote {chk['bullets']} bullets and cut the only "
-                      f"literal evidence for **{len(chk['dropped_evidence'])}** "
-                      f"requirement(s), so the score was scaled by "
-                      f"{chk['ratio']:.2f}:", "",
-                      "- " + "\n- ".join(chk["dropped_evidence"]), ""]
+    lines += ([f"- **{t}** — {w[0]}, bullet {w[1]}" for t, w in proven.items()]
+              or ["_none_"])
+
+    top = required[:3]
+    first = next((j["key"] for j in base.jobs if used.get(j["key"])), None)
+    if first and top:
+        carried = [t for t in top if _kw_present(t, _norm_text(_bullet_line(used[first][0])))]
+        lines += ["", "## First bullet check", ""]
+        if carried:
+            lines.append(f"The first bullet under **{first.title()}** — the most-read line "
+                         f"on the page — carries **{', '.join(carried)}** ({len(carried)} of "
+                         f"the top {len(top)} required terms).")
         else:
-            lines += [f"`assemble` wrote all {chk['bullets']} selected bullets with "
-                      f"nothing cut, so the document matches what was scored and the "
-                      f"score stands.", ""]
-        lines += [f"_Literal keyword check (diagnostic, not the score): "
-                  f"{chk['coverage_doc']} of {chk['must_total']} requirements appear "
-                  f"word-for-word in a bullet. This undercounts badly — a Kafka bullet "
-                  f"evidences 'publish/subscribe' without the words, and "
-                  f"'two database technologies' can never match literally. Use it to "
-                  f"spot what is missing, not to judge fit._", ""]
-        if chk["skills_only"]:
-            lines += ["**Claimed in the SKILLS line only — no bullet proves these:** "
-                      + ", ".join(chk["skills_only"]), ""]
-        if chk["lost"]:
-            lines += ["**Not literally present anywhere on the page** (check these by eye): "
-                      + ", ".join(chk["lost"]), ""]
+            lines.append(f"The first bullet under **{first.title()}** carries none of the top "
+                         f"{len(top)} required terms ({', '.join(top)}). The most-read line "
+                         f"on the page is serving something nobody ordered.")
+
+    claims = ([f"- **{t}** — SKILLS line only" for t in rs.get("claims_skills") or []]
+              + [f"- **{t}** — Key Achievements only (names no employer)"
+                 for t in rs.get("claims_achievements") or []])
+    if claims:
+        lines += ["", "## Claims without proof", "",
+                  "On the page, but nowhere a recruiter counts it — prove these inside a job:",
+                  ""] + claims
+    if rs.get("page_gaps"):
+        lines += ["", "## Page gaps — in your bank, not on this page", "",
+                  "A bullet in your templates says these, but it lost its slot to "
+                  "higher-priority terms in the page budget:", ""]
+        lines += [f"- {t}" for t in rs["page_gaps"]]
+    lines += ["", "## Bank gaps — no bullet anywhere says these", ""]
+    if rs.get("bank_gaps"):
+        lines += ["Pooled into `KEYWORD_GAPS.md`. If the experience is real, write it into a "
+                  "master template in the posting's own words:", ""]
+        lines += [f"- {t}" for t in rs["bank_gaps"]]
+    else:
+        lines.append("_none — every required term is said somewhere in your bank_")
+
+    if plan.get("preferred_terms"):
+        lines += ["", "## Preferred terms (reported, never scored)", "",
+                  "Proven: " + (", ".join(rs.get("proven_preferred") or {}) or "_none_"), "",
+                  "Not proven: " + (", ".join(rs.get("preferred_unproven") or []) or "_none_")]
+    if plan.get("meta_requirements"):
+        lines += ["", "## Check by eye — requirements no bullet can state", ""]
+        lines += [f"- {m}" for m in plan["meta_requirements"]]
+    if plan.get("moved_terms"):
+        lines += ["", "## Moved to check by eye — clauses, not terms", "",
+                  "No bullet could ever contain these word-for-word, so they are not scored:", ""]
+        lines += [f"- {t}" for t in plan["moved_terms"]]
+    if plan.get("ignored_terms"):
+        lines += ["", "## Ignored — not in the posting's own wording", "",
+                  ", ".join(plan["ignored_terms"])]
+    if swaps:
+        lines += ["", f"## Coverage repair ({len(swaps)})", ""] + [f"- {s}" for s in swaps]
+    if filled:
+        lines += ["", f"## Page fill ({len(filled)})", "",
+                  "Claude left slots empty; these were added to reach the page budget:", ""]
+        lines += [f"- {f}" for f in filled]
+    if variety:
+        lines += ["", f"## Variety ({len(variety)})", "",
+                  f"No opening verb starts more than {MAX_VERB_USES} bullets, and no claim "
+                  f"prints twice:", ""] + [f"- {v}" for v in variety]
+
     lines += ["", "## Bullets used", ""]
     for block, items in used.items():
-        lines.append(f"**{block}**")
+        lines.append(f"**{block.title()}**")
         lines += [f"{i}. {t}" for i, t in enumerate(items, 1)] + [""]
     if plan.get("selection_notes"):
         lines += [f"_{plan['selection_notes']}_", ""]
@@ -666,74 +1191,99 @@ def write_report(path, job, plan, used, dropped, base, rehomed=None):
         f.write("\n".join(lines))
 
 
+def log_score(job: dict, plan: dict, passed: bool, bar) -> None:
+    """One line per scored posting, pass or fail, so the bar can be tuned from data."""
+    rs = plan.get("recruiter") or {}
+    row = {"ts": datetime.now().isoformat(timespec="seconds"),
+           "company": job.get("company"), "title": job.get("title"),
+           "job_id": str(job.get("job_id", "")), "url": job.get("url"),
+           "recruiter": rs.get("score"), "semantic": plan.get("semantic_score"),
+           "required": rs.get("required"), "proven": len(rs.get("proven") or {}),
+           "bar": bar, "passed": passed}
+    path = os.path.join(OUT_DIR, GAP_DIR_NAME, "scored.jsonl")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(row) + "\n")
+    except OSError as e:
+        log.warning("could not append to %s: %s", path, e)
+
+
 # ---------------------------------------------------------------- job sources
 def safe(s, n=48):
     return re.sub(r"[^A-Za-z0-9._-]+", "_", s or "").strip("_")[:n] or "job"
 
 
 def tailor_job(job, cfg, templates, bank, skills, model, notify=True, min_score=None):
-    """Score a posting against the bullet bank, and build a resume only if it clears
-    `min_score`. Below the bar nothing is written: the score and the keyword gaps are
-    still recorded, because a weak match is exactly where the gap list is useful."""
+    """Score a posting the way a recruiter reads it, and build a resume only if it clears
+    `min_score`.
+
+    Claude extracts the posting's required terms and proposes a selection. Everything
+    after that is deterministic: misfiled bullets are re-homed, coverage is repaired
+    inside the page budget, the page is ordered so the most-asked-for terms come first,
+    and the recruiter score - required terms proven in the posting's own words inside a
+    job - decides whether a resume is written and an alert sent. Claude's semantic score
+    is recorded for context and never gates anything. Below the bar nothing is written,
+    but the score and the gaps are still recorded: a weak match is exactly where the gap
+    list is useful.
+    """
     jd = job.get("description") or ""
     if not jd.strip():
         log.warning("no job description for %s — skipping", job["title"])
         return None
-    plan = ask_claude(jd, job["title"], job["company"], bank, skills, model)
-    score = plan.get("match_score")
+    plan = normalize_plan(ask_claude(jd, job["title"], job["company"], bank, skills, model))
+    plan["moved_terms"] = split_long_terms(plan)
+    plan["ignored_terms"] = validate_terms(plan, jd)
+    if plan["ignored_terms"]:
+        log.info("[%s] %s - ignored %d term(s) not in the posting's wording: %s",
+                 job["company"], job["title"][:50], len(plan["ignored_terms"]),
+                 ", ".join(plan["ignored_terms"][:6]))
 
-    # Cheap pre-filter. The verified score can only ever be <= the planned score
-    # (verify_resume scales by surviving/planned evidence, a ratio of at most 1), so a
-    # posting that fails here could never have cleared the bar after assembly either.
-    # Nothing that would have passed the real gate below is lost by skipping the build.
-    if min_score is not None and (score is None or score < min_score):
-        base_kind = plan.get("base_template") or "?"
-        record_gaps(plan, job, base_kind)
-        log.info("[%s] %s - score %s below %s, no resume built", job["company"],
-                 job["title"][:60], score, min_score)
-        return {"folder": None, "score": score, "plan": plan, "passed": False}
+    base = pick_base(plan, templates)
+    terms = plan["required_terms"]
+    chosen, dropped, rehomed = select_blocks(plan, bank, base)
+    swaps = repair_coverage(chosen, bank, terms, base)
+    chosen, variety = enforce_variety(order_blocks(chosen, bank, terms), bank, terms, base)
+    chosen, filled = fill_page(chosen, bank, plan, base)
+    chosen = separate_repeats(order_blocks(chosen, bank, terms), bank)
+    rs = plan["recruiter"] = recruiter_score(plan, chosen, bank, base)
+    plan["missing_keywords"] = rs["bank_gaps"]   # record_gaps pools only real bank gaps
+    score, semantic = rs["score"], plan.get("semantic_score")
+
+    gaps = record_gaps(plan, job, base.kind)
+    passed = min_score is None or (score is not None and score >= min_score)
+    log_score(job, plan, passed, min_score)
+    if not passed:
+        log.info("[%s] %s - recruiter %s/100 (semantic %s) below %s, no resume built",
+                 job["company"], job["title"][:60], score, semantic, min_score)
+        return {"folder": None, "score": score, "semantic_score": semantic,
+                "plan": plan, "passed": False}
 
     folder = os.path.join(OUT_DIR, f"{safe(job['company'],24)}__{safe(job['title'],40)}__{safe(str(job.get('job_id','')),14)}")
     os.makedirs(folder, exist_ok=True)
     docx = os.path.join(folder, f"KALYANKUMAR_KONDURU_{safe(job['company'],20).upper()}.docx")
-    base, used, dropped, rehomed = assemble(plan, bank, templates, docx)
-
-    # Final check: score the document that was actually written, not the plan.
-    check = verify_resume(plan, used, base, plan.get("extra_skill_terms") or [], bank)
-    if check:
-        plan["verified"] = check
-        final = check["final_score"]
-        if check["dropped_evidence"]:
-            log.warning("[%s] %s - %s/100 -> %s/100: assembly cut evidence for %s",
-                        job["company"], job["title"][:50], score, final,
-                        ", ".join(check["dropped_evidence"][:6]))
-    else:
-        final = score
-
-    write_report(os.path.join(folder, "match_report.md"), job, plan, used, dropped, base,
-                 rehomed)
+    render_resume(base, chosen, bank, docx, rs["padding"])
+    write_report(os.path.join(folder, "match_report.md"), job, plan, used_texts(chosen, bank),
+                 dropped, base, rehomed, swaps, variety, filled)
     with open(os.path.join(folder, "job_description.txt"), "w") as f:
         f.write(f"{job['title']}\n{job['company']}\n{job.get('url','')}\n\n{jd}")
+    with open(os.path.join(folder, "plan.json"), "w") as f:
+        json.dump(plan, f, indent=2, default=str)
 
-    gaps = record_gaps(plan, job, base.kind)
-
-    # The gate that decides whether this is worth telling you about is applied to the
-    # score of the DOCUMENT, after assembly - not to the plan that preceded it.
-    cleared = min_score is None or final is None or final >= min_score
-    if not cleared:
-        log.info("[%s] %s -> built but verified %s/100 below %s, no alert sent (%s)",
-                 job["company"], job["title"][:50], final, min_score, folder)
-        return {"folder": folder, "score": final, "planned_score": score,
-                "plan": plan, "passed": False}
-
-    log.info("[%s] %s -> %s (score %s, base %s)", job["company"], job["title"], folder,
-             final, base.kind)
+    log.info("[%s] %s -> %s (recruiter %s/100, semantic %s, base %s)", job["company"],
+             job["title"], folder, score, semantic, base.kind)
+    if swaps:
+        log.info("  coverage repair: %s", "; ".join(re.sub(r"[`*]", "", s) for s in swaps[:4]))
+    if filled:
+        log.info("  page fill: %d bullet(s) added to reach the page budget", len(filled))
+    if variety:
+        log.info("  variety: %d change(s) - %s", len(variety),
+                 "; ".join(re.sub(r"[`*]", "", v) for v in variety[:3]))
     if gaps:
-        log.info("  %d gap keyword(s) pooled into %s",
-                 len(plan.get("missing_keywords") or []), gaps)
+        log.info("  %d bank gap(s) pooled into %s", len(rs["bank_gaps"]), gaps)
     if notify:
         notify_discord(job, plan, folder)
-    return {"folder": folder, "score": final, "planned_score": score,
+    return {"folder": folder, "score": score, "semantic_score": semantic,
             "plan": plan, "passed": True}
 
 
@@ -741,26 +1291,26 @@ def notify_discord(job, plan, folder):
     hook = os.environ.get("DISCORD_WEBHOOK_URL")
     if not hook:
         return
-    chk = plan.get("verified") or {}
-    planned = plan.get("match_score") or 0
-    score = chk.get("final_score", planned)
+    rs = plan.get("recruiter") or {}
+    score = rs.get("score") or 0
+    proven = rs.get("proven") or {}
+    required = plan.get("required_terms") or []
+    missing = (rs.get("page_gaps") or []) + (rs.get("bank_gaps") or [])
     color = 0x43B581 if score >= 75 else (0xFAA61A if score >= 55 else 0xED4245)
-    miss = ", ".join((plan.get("missing_keywords") or [])[:12]) or "none"
-    fields = [{"name": "Role", "value": job["title"][:250], "inline": False},
-              {"name": "Base template", "value": plan.get("base_template", "?"), "inline": True}]
-    if chk:
-        if chk.get("dropped_evidence"):
-            verdict = (f"{planned} -> **{score}** · assembly cut evidence for "
-                       + ", ".join(chk["dropped_evidence"][:6]))
-        else:
-            verdict = f"**{score}/100** · all {chk['bullets']} selected bullets made the page"
-        fields.append({"name": "Final check", "value": verdict[:1000], "inline": False})
-        if chk["skills_only"]:
-            fields.append({"name": "In SKILLS only, no bullet proof",
-                           "value": ", ".join(chk["skills_only"])[:1000], "inline": False})
-    fields += [{"name": "Folder", "value": f"`{folder}`"[:1000], "inline": False},
-               {"name": "Gaps", "value": miss[:1000], "inline": False}]
-    embed = {"title": f"📄 Resume ready — {score}/100"[:250], "url": job.get("url") or None,
+    fields = [
+        {"name": "Role", "value": job["title"][:250], "inline": False},
+        {"name": f"Proven in their words ({len(proven)} of {len(required)})",
+         "value": (", ".join(proven) or "none")[:1000], "inline": False},
+        {"name": "Not on the page", "value": (", ".join(missing) or "none")[:1000],
+         "inline": False},
+        {"name": "Semantic (context)", "value": f"{plan.get('semantic_score', '?')}/100",
+         "inline": True},
+        {"name": "Base template", "value": str(plan.get("base_template") or "?"),
+         "inline": True},
+        {"name": "Folder", "value": f"`{folder}`"[:1000], "inline": False},
+    ]
+    embed = {"title": f"📄 Resume ready — recruiter {score}/100"[:250],
+             "url": job.get("url") or None,
              "description": (plan.get("fit_assessment") or "")[:600], "color": color,
              "fields": fields}
     try:
@@ -798,6 +1348,119 @@ def fetch_missing_description(cfg, job):
         return ""
 
 
+# ---------------------------------------------------------------- calibration & audit
+def score_summary() -> str:
+    """Recruiter vs semantic scores from scored.jsonl, so the bar is set from data.
+
+    Literal scores run lower than semantic ones, so a bar tuned on the old semantic
+    score will alert far less often. This shows what each bar would have let through.
+    """
+    path = os.path.join(OUT_DIR, GAP_DIR_NAME, "scored.jsonl")
+    try:
+        with open(path) as f:
+            rows = [json.loads(line) for line in f if line.strip()]
+    except FileNotFoundError:
+        return "No scores yet - they accumulate in scored.jsonl as postings are tailored."
+    rec = [r["recruiter"] for r in rows if isinstance(r.get("recruiter"), (int, float))]
+    sem = [r["semantic"] for r in rows if isinstance(r.get("semantic"), (int, float))]
+    if not rec:
+        return f"{len(rows)} posting(s) logged, none with a recruiter score yet."
+    out = [f"{len(rec)} posting(s) scored   median recruiter {statistics.median(rec):.0f}"
+           + (f"   median semantic {statistics.median(sem):.0f}" if sem else ""),
+           "", "recruiter score distribution:"]
+    for lo in range(0, 100, 10):
+        hi = 100 if lo == 90 else lo + 9
+        n = sum(1 for v in rec if lo <= v <= hi)
+        out.append(f"  {lo:>3}-{hi:<3} {'#' * n} {n}")
+    out += ["", "alerts each bar would have sent:"]
+    for bar in (40, 50, 55, 60, 65, 70, 75, 80):
+        n = sum(1 for v in rec if v >= bar)
+        out.append(f"  >= {bar}:  {n:>3} of {len(rec)}  ({100 * n // len(rec)}%)")
+    return "\n".join(out)
+
+
+def _bullet_usage() -> dict:
+    """How often each bullet has been printed, read back from the 'Bullets used' list of
+    every match_report.md - so the bullets recruiters see most get rewritten first."""
+    counts = {}
+    pattern = re.compile(r"^\d+\. (.*?)\s+\[[a-z_]+\]\s*$")
+    for report in glob.glob(os.path.join(OUT_DIR, "*", "match_report.md")):
+        try:
+            with open(report) as f:
+                for line in f:
+                    m = pattern.match(line.strip())
+                    if m:
+                        counts[m.group(1)] = counts.get(m.group(1), 0) + 1
+        except OSError:
+            continue
+    return counts
+
+
+def bank_audit(bank: dict) -> tuple[str, dict]:
+    """Which bullets a recruiter cannot yet read as a qualification.
+
+    The tailor enforces WHAT (their words) and WHERE (inside a job). HOW, WHY and real
+    numbers are facts only the candidate has, so this is a worklist rather than a fix:
+    bullets with no plain-English reason, a percentage with no real scale behind it, or
+    an opening verb that would be just as true of a different job.
+    """
+    usage = _bullet_usage()
+    totals = {"bullets": len(bank), "no_why": 0, "pct_no_scale": 0, "vague": 0,
+              "achievements": 0}
+    flagged = {}
+    for bid, b in bank.items():
+        text, flags = b["text"], []
+        if not WHY_RE.search(text):
+            flags.append("no WHY")
+            totals["no_why"] += 1
+        if PCT_RE.search(text) and not SCALE_RE.search(text):
+            flags.append("% without scale")
+            totals["pct_no_scale"] += 1
+        if VAGUE_RE.match(text):
+            flags.append("vague verb")
+            totals["vague"] += 1
+        totals["achievements"] += b["block"] == "achievements"
+        if flags:
+            flagged.setdefault((b["tpl"].kind, b["block"]), []).append(
+                (usage.get(text, 0), len(flags), bid, text, flags))
+
+    n = max(1, totals["bullets"])
+
+    def share(k):
+        return f"{100 * totals[k] // n}%"
+
+    lines = [
+        "# Bank audit — WHAT / HOW / WHY / WHERE", "",
+        "A recruiter counts a qualification only when a bullet says what was used (their "
+        "words), how, why in plain English, and where. The tailor already enforces WHAT and "
+        "WHERE. The rest are facts only you have — so this is the list of bullets to "
+        "rewrite in the master templates, most-printed first.", "",
+        f"_generated {datetime.now():%Y-%m-%d %H:%M} from {totals['bullets']} bullets_", "",
+        "| Check | Bullets failing | Share |", "|---|---:|---:|",
+        f"| No plain-English reason (WHY) | {totals['no_why']} | {share('no_why')} |",
+        f"| Percentage with no real scale behind it | {totals['pct_no_scale']} | "
+        f"{share('pct_no_scale')} |",
+        f"| Opens with a verb that proves nothing | {totals['vague']} | {share('vague')} |", "",
+        f"{totals['achievements']} bullets live in Key Achievements, which names no employer. "
+        f"A term proven only there reads as a claim — make sure the same work also appears "
+        f"under a job.", "",
+        "**A passing bullet:** *Built REST APIs in Python with FastAPI, PostgreSQL and AWS so "
+        "customers could schedule their own email briefings instead of asking our team to "
+        "pull the data by hand.* Their words, how, a reason a non-engineer understands, "
+        "inside a real job.", "",
+    ]
+    for (kind, block), rows in sorted(flagged.items(),
+                                      key=lambda kv: (kv[0][0], kv[0][1] != "achievements",
+                                                      kv[0][1])):
+        rows.sort(key=lambda r: (-r[0], -r[1], r[2]))
+        lines += [f"## {kind} — {block.title()} ({len(rows)})", "",
+                  "| Used | Bullet | Missing |", "|---:|---|---|"]
+        lines += [f"| {used} | {text.replace('|', '/')} | {', '.join(flags)} |"
+                  for used, _, _, text, flags in rows]
+        lines.append("")
+    return "\n".join(lines), totals
+
+
 # ---------------------------------------------------------------- entry points
 def run(cfg, con, templates, bank, skills, model, jobs, notify=True, min_score=None):
     ensure_schema(con)
@@ -831,6 +1494,10 @@ def main():
     ap = argparse.ArgumentParser(add_help=True)
     ap.add_argument("--fit", action="store_true",
                     help="show the one-page budget and the geometry behind it")
+    ap.add_argument("--audit", action="store_true",
+                    help="write BANK_AUDIT.md: bullets missing a WHY, scale or concrete verb")
+    ap.add_argument("--scores", action="store_true",
+                    help="recruiter vs semantic score distribution, to tune the bar")
     ap.add_argument("--run", action="store_true", help="tailor all untailored matches")
     ap.add_argument("--job", type=int, help="tailor one job by # from --list")
     ap.add_argument("--url", help="tailor an arbitrary posting URL")
@@ -867,6 +1534,9 @@ def main():
             tpl = max(e["templates"], key=e["templates"].get) if e.get("templates") else "-"
             print(f"  {e['count']:>3}x  {e['keyword'][:48]:<50} ({tpl})")
         print(f"\nfull report: {md_path}")
+        return
+    if a.scores:
+        print(score_summary())
         return
     if a.list:
         for r in db_jobs(con, "matched=1 ORDER BY first_seen DESC LIMIT ?", (60,)):
@@ -908,6 +1578,20 @@ def main():
         print("\nThis is an estimate from the template's geometry, not a render. Open a "
               "generated .docx;\nif space is left over raise page_lines, if it spills "
               "onto page two lower it.")
+        return
+    elif a.audit:
+        text, totals = bank_audit(bank)
+        path = os.path.join(OUT_DIR, GAP_DIR_NAME, "BANK_AUDIT.md")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(text)
+        n = totals["bullets"]
+        print(f"{n} bullets audited:")
+        print(f"  {n - totals['no_why']:>4} say WHY in plain English   "
+              f"({totals['no_why']} don't)")
+        print(f"  {totals['pct_no_scale']:>4} use a percentage with no real scale")
+        print(f"  {totals['vague']:>4} open with a verb that proves nothing")
+        print(f"\nworklist, most-printed bullets first: {path}")
         return
     elif a.run:
         jobs = db_jobs(con, "matched=1 AND (tailored IS NULL OR tailored='') "
