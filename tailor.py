@@ -11,12 +11,15 @@ bullets that already exist in your master templates.
   python tailor.py --fit                  # one-page budget and the geometry behind it
   python tailor.py --audit                # bullets missing a WHY, real scale, or a concrete verb
   python tailor.py --scores               # recruiter vs semantic scores, to tune the bar
+  python tailor.py --away                 # away days, and a test write to iCloud Drive
 
 Output per job, under ./applications/<Company>__<Title>__<id>/ :
   <NAME>_<Company>.docx   the tailored resume
   match_report.md         recruiter score, proof per term, gaps, and the bullets used
   job_description.txt     the JD it was built from
   plan.json               Claude's full answer plus the scoring, for re-scoring later
+On a date listed in away.yaml, inside its hours, the .docx is also copied to
+iCloud Drive/<folder>/<Company>__<Title>__<id>/ so it can be attached from a phone.
 
 How the resume is produced:
   Claude reads the JD, copies its required terms VERBATIM, and CHOOSES bullet IDs
@@ -36,6 +39,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import statistics
 import sys
@@ -1309,6 +1313,93 @@ class LiveTrace:
             log.debug("live snapshot failed: %s", e)
 
 
+# ---------------------------------------------------------------- away days
+AWAY_FILE = os.path.join(HERE, "away.yaml")
+ICLOUD_ROOT = os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs")
+
+
+def load_away(path=None) -> dict:
+    """away.yaml, read fresh on every call so a date added while the watcher runs counts
+    from the next resume on. Missing or broken file = no away days."""
+    try:
+        with open(path or AWAY_FILE) as f:
+            return yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        log.warning("away.yaml unreadable (%s) - resumes stay local only", e)
+        return {}
+
+
+def _minutes(hhmm: str) -> int:
+    h, m = str(hhmm).strip().split(":")
+    return int(h) * 60 + int(m)
+
+
+def away_window(away: dict, now=None):
+    """(start, end) in minutes when `now` falls on a listed away date, else None. A date
+    may carry its own hours ("2026-10-14 12:00-18:00"); otherwise `hours` applies."""
+    now = now or datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    for entry in away.get("dates") or []:
+        day, _, hours = str(entry).strip().partition(" ")
+        if day == today:
+            start, end = (hours.strip() or away.get("hours") or "09:00-17:00").split("-")
+            return _minutes(start), _minutes(end)
+    return None
+
+
+def away_now(now=None, path=None) -> bool:
+    now = now or datetime.now()
+    win = away_window(load_away(path), now)
+    return bool(win) and win[0] <= now.hour * 60 + now.minute < win[1]
+
+
+def icloud_dir(away=None) -> str:
+    away = load_away() if away is None else away
+    return os.path.join(ICLOUD_ROOT, str(away.get("folder") or "JobResumes"))
+
+
+def copy_to_icloud(docx: str, folder: str, now=None, path=None):
+    """During away hours, also drop the resume into iCloud Drive so it can be attached
+    from the phone. The local copy stays where it is; a failed copy only logs."""
+    if not away_now(now, path):
+        return None
+    dest_dir = os.path.join(icloud_dir(load_away(path)), os.path.basename(folder))
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        return shutil.copy2(docx, dest_dir)
+    except OSError as e:
+        log.warning("iCloud copy failed (%s) - resume is still in %s", e, folder)
+        return None
+
+
+def away_status() -> str:
+    """The schedule as the watcher sees it, plus a real write to iCloud Drive - run it
+    from the terminal that runs the watcher, since macOS grants iCloud access per app."""
+    away = load_away()
+    now = datetime.now()
+    lines = [f"away.yaml: {AWAY_FILE}",
+             f"default hours: {away.get('hours') or '09:00-17:00'}",
+             f"iCloud folder: {icloud_dir(away)}", "dates:"]
+    upcoming = [str(d) for d in away.get("dates") or []
+                if str(d)[:10] >= now.strftime("%Y-%m-%d")]
+    lines += [f"  {d}" for d in upcoming] or ["  (none upcoming)"]
+    lines.append(f"right now ({now:%Y-%m-%d %H:%M}): "
+                 + ("AWAY - resumes also go to iCloud" if away_now(now) else "home - local only"))
+    probe = os.path.join(icloud_dir(away), ".write_test")
+    try:
+        os.makedirs(os.path.dirname(probe), exist_ok=True)
+        with open(probe, "w") as f:
+            f.write(now.isoformat())
+        os.remove(probe)
+        lines.append("iCloud write test: OK")
+    except OSError as e:
+        lines.append(f"iCloud write test: FAILED ({e}) - give this terminal access to "
+                     "iCloud Drive in System Settings > Privacy & Security > Files and Folders")
+    return "\n".join(lines)
+
+
 def tailor_job(job, cfg, templates, bank, skills, model, notify=True, min_score=None):
     """Score a posting the way a recruiter reads it, and build a resume only if it clears
     `min_score`.
@@ -1385,6 +1476,7 @@ def tailor_job(job, cfg, templates, bank, skills, model, notify=True, min_score=
     os.makedirs(folder, exist_ok=True)
     docx = os.path.join(folder, f"KALYANKUMAR_KONDURU_{safe(job['company'],20).upper()}.docx")
     render_resume(base, chosen, bank, docx, rs["padding"])
+    plan["icloud"] = copy_to_icloud(docx, folder)
     write_report(os.path.join(folder, "match_report.md"), job, plan, used_texts(chosen, bank),
                  dropped, base, rehomed, swaps, variety, filled)
     with open(os.path.join(folder, "job_description.txt"), "w") as f:
@@ -1403,6 +1495,8 @@ def tailor_job(job, cfg, templates, bank, skills, model, notify=True, min_score=
                  "; ".join(re.sub(r"[`*]", "", v) for v in variety[:3]))
     if gaps:
         log.info("  %d bank gap(s) pooled into %s", len(rs["bank_gaps"]), gaps)
+    if plan["icloud"]:
+        log.info("  away day: copied to iCloud Drive -> %s", plan["icloud"])
     trace.emit("done", folder=folder, docx=docx)
     if notify:
         notify_discord(job, plan, folder)
@@ -1434,6 +1528,11 @@ def notify_discord(job, plan, folder):
          "inline": True},
         {"name": "Folder", "value": f"`{folder}`"[:1000], "inline": False},
     ]
+    if plan.get("icloud"):
+        fields.append({"name": "📱 On your phone",
+                       "value": ("Files › iCloud Drive › " + " › ".join(
+                           os.path.relpath(plan["icloud"], ICLOUD_ROOT).split(os.sep)))[:1000],
+                       "inline": False})
     embed = {"title": f"📄 Resume ready — recruiter {score}/100"[:250],
              "url": job.get("url") or None,
              "description": (plan.get("fit_assessment") or "")[:600], "color": color,
@@ -1640,7 +1739,12 @@ def main():
     ap.add_argument("--min-score", type=int, help="override tailor.min_match_score")
     ap.add_argument("--model", default=os.environ.get("TAILOR_MODEL", DEFAULT_MODEL))
     ap.add_argument("--no-notify", action="store_true")
+    ap.add_argument("--away", action="store_true",
+                    help="show away days and test writing to iCloud Drive")
     a = ap.parse_args()
+    if a.away:
+        print(away_status())
+        return
 
     with open(watcher.CONFIG_PATH) as f:
         cfg = yaml.safe_load(f)

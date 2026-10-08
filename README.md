@@ -29,6 +29,16 @@ caffeinate -i python watcher.py           # run continuously
 Each cycle: fetch all boards concurrently → fetch the job description for each new
 match → screen it → alert on the survivors → build tailored resumes.
 
+### Away days: resumes on your phone
+
+List the dates you're away in `away.yaml`. On those dates, from 9:00 to 17:00 (or a
+date's own hours), each resume is also copied to iCloud Drive › JobResumes ›
+`<Company>__<Title>__<id>/`, and the Discord card shows that path. The local copy in
+`applications/` is always kept. The file is re-read for every resume, so you can edit it
+while the watcher runs. `python tailor.py --away` shows the schedule and test-writes to
+iCloud Drive. Run it from the terminal that runs the watcher, since macOS grants iCloud
+access per app.
+
 ### Screening before the alert
 
 Two filters run on the job description before anything reaches Discord.

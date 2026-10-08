@@ -1,0 +1,12 @@
+# Days you're away from the Mac. On a listed date, inside the hours, every resume the
+# watcher builds is ALSO copied to iCloud Drive/<folder>/ so you can attach it from
+# your phone (Files app). The local copy in applications/ is always kept.
+# Read fresh for every resume - edit while the watcher runs, no restart needed.
+# Check with: python tailor.py --away
+hours: "09:00-17:00"          # default window for every date below
+folder: JobResumes            # iCloud Drive/JobResumes/<Company>__<Title>__<id>/
+dates:
+  - "2026-10-08"
+  - "2026-10-09"
+  - "2026-10-10"
+  # - "2026-10-14 12:00-18:00"   # a date can carry its own hours
