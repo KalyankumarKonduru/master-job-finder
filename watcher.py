@@ -1218,6 +1218,27 @@ def check(cfg, tfilter):
         time.sleep(REQUEST_GAP)
 
 
+def serve_live_preview(cfg, preview):
+    """Serve the live preview page if nothing else does. Tried every cycle, so the
+    watcher takes the port over once a stand-alone live_preview.py lets it go."""
+    if not preview["want"] or preview["url"]:
+        return
+    try:
+        import live_preview
+        preview["url"] = live_preview.start_in_background(cfg)
+    except Exception as e:                      # watching is optional; polling is not
+        log.warning("live preview unavailable: %s", e)
+        preview["want"] = False
+        return
+    if preview["url"]:
+        log.info("live preview: %s - every scored posting plays there as it is built",
+                 preview["url"])
+    elif not preview["warned"]:
+        log.info("live preview port is taken (live_preview.py running?) - it serves the "
+                 "same runs; the watcher takes over if it stops")
+        preview["warned"] = True
+
+
 def main():
     with open(CONFIG_PATH) as f:
         cfg = yaml.safe_load(f)
@@ -1301,9 +1322,14 @@ def main():
         poll_once(cfg, con, tfilter)
         return
 
+    tcfg = cfg.get("tailor") or {}
+    preview = {"want": bool(tcfg.get("enabled") and tcfg.get("live_preview", True)),
+               "url": None, "warned": False}
+
     interval = float(cfg.get("poll_interval_minutes", 5)) * 60
     jitter = float(cfg.get("jitter_seconds", 10))
     while True:
+        serve_live_preview(cfg, preview)
         started = time.time()
         poll_once(cfg, con, tfilter)
         # Fixed rate: the cycle's own runtime counts toward the interval, so polls

@@ -53,6 +53,7 @@ log = logging.getLogger("tailor")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT_DIR = os.environ.get("JOBWATCH_APPLICATIONS") or os.path.join(HERE, "applications")
+LIVE_DIR = None             # <OUT_DIR>/_live once configured: one step file per posting
 DEFAULT_MODEL = "claude-sonnet-5"
 MAX_JD_CHARS = 18000
 MAX_TOKENS = 16000
@@ -80,6 +81,7 @@ def apply_config(cfg):
     """Let config.yaml override the budget, model and compact layout."""
     global PAGE_BUDGET, DEFAULT_JOB_BUDGET, COMPACT, OUT_DIR, MAX_TOKENS, LINE_SPACING
     global ACHIEVEMENTS_CAP, JOB_BULLETS, PAGE_LINES, EXPLICIT_BLOCKS, PROOF_INCLUDES_ACHIEVEMENTS, MAX_VERB_USES
+    global LIVE_DIR
     t = (cfg or {}).get("tailor") or {}
     pb = {str(k).lower(): v for k, v in (t.get("page_budget") or {}).items()}
     ACHIEVEMENTS_CAP = int(pb.pop("achievements", ACHIEVEMENTS_CAP))
@@ -100,6 +102,7 @@ def apply_config(cfg):
                                  exclude=t.get("templates_exclude") or [])
     if t.get("output_dir"):
         OUT_DIR = t["output_dir"] if os.path.isabs(t["output_dir"]) else os.path.join(HERE, t["output_dir"])
+    LIVE_DIR = os.path.join(OUT_DIR, "_live") if t.get("live_preview", True) else None
     return t
 
 
@@ -1242,6 +1245,70 @@ def safe(s, n=48):
     return re.sub(r"[^A-Za-z0-9._-]+", "_", s or "").strip("_")[:n] or "job"
 
 
+# ---------------------------------------------------------------- live preview
+def append_live(path, step: str, **data) -> None:
+    """One step as a JSON line. Watching the tailor must never break it, so a failed
+    write is logged and dropped."""
+    if not path:
+        return
+    try:
+        with open(path, "a") as f:
+            f.write(json.dumps({"step": step, "ts": round(time.time(), 3), **data},
+                               default=str) + "\n")
+    except OSError as e:
+        log.debug("live trace write failed: %s", e)
+
+
+def page_snapshot(chosen: dict, bank: dict, base, terms: list[str]) -> list[dict]:
+    """The page as it stands: every block in print order, each bullet with the
+    required terms (by index) it proves."""
+    heads = {j["key"]: j for j in base.jobs}
+    proof = proof_blocks(base)
+    return [{"block": block,
+             "title": heads.get(block, {}).get("title") or "Key Achievements",
+             "company": heads.get(block, {}).get("company", ""),
+             "meta": heads.get(block, {}).get("meta", ""),
+             "proof": block in proof,
+             "bullets": [{"id": bid, "text": bank[bid]["text"],
+                          "hits": sorted(_hits(bank[bid]["text"], terms))}
+                         for bid in chosen.get(block) or [] if bid in bank]}
+            for block in block_order(base)]
+
+
+class LiveTrace:
+    """One posting's trip through the pipeline, written step by step to its own file in
+    LIVE_DIR for live_preview.py to play back as it happens."""
+
+    def __init__(self, job: dict):
+        self.path = None
+        if not LIVE_DIR:
+            return
+        try:
+            os.makedirs(LIVE_DIR, exist_ok=True)
+            stem = (f"{datetime.now():%Y%m%d-%H%M%S}_{safe(job.get('company'), 20)}_"
+                    f"{safe(str(job.get('job_id', '')), 14)}")
+            path, n = os.path.join(LIVE_DIR, stem + ".jsonl"), 1
+            while os.path.exists(path):
+                n += 1
+                path = os.path.join(LIVE_DIR, f"{stem}-{n}.jsonl")
+            self.path = path
+        except OSError as e:
+            log.debug("live trace off for this posting: %s", e)
+
+    def emit(self, step: str, **data) -> None:
+        append_live(self.path, step, **data)
+
+    def page(self, stage: str, label: str, chosen, bank, base, terms, notes=()) -> None:
+        if not self.path:
+            return
+        try:
+            self.emit("page", stage=stage, label=label,
+                      notes=[re.sub(r"[`*]", "", str(n)) for n in notes or ()],
+                      blocks=page_snapshot(chosen, bank, base, terms))
+        except Exception as e:                # a snapshot bug must not stop a resume
+            log.debug("live snapshot failed: %s", e)
+
+
 def tailor_job(job, cfg, templates, bank, skills, model, notify=True, min_score=None):
     """Score a posting the way a recruiter reads it, and build a resume only if it clears
     `min_score`.
@@ -1259,7 +1326,16 @@ def tailor_job(job, cfg, templates, bank, skills, model, notify=True, min_score=
     if not jd.strip():
         log.warning("no job description for %s — skipping", job["title"])
         return None
-    plan = normalize_plan(ask_claude(jd, job["title"], job["company"], bank, skills, model))
+    trace = LiveTrace(job)
+    trace.emit("job", company=job.get("company"), title=job.get("title"),
+               url=job.get("url") or "", job_id=str(job.get("job_id", "")), jd=jd,
+               model=model, bar=min_score)
+    try:
+        raw = ask_claude(jd, job["title"], job["company"], bank, skills, model)
+    except Exception as e:
+        trace.emit("error", message=str(e)[:400])
+        raise
+    plan = normalize_plan(raw)
     plan["moved_terms"] = split_long_terms(plan)
     plan["ignored_terms"] = validate_terms(plan, jd)
     if plan["ignored_terms"]:
@@ -1269,21 +1345,39 @@ def tailor_job(job, cfg, templates, bank, skills, model, notify=True, min_score=
 
     base = pick_base(plan, templates)
     terms = plan["required_terms"]
+    trace.emit("plan", required=terms, preferred=plan.get("preferred_terms") or [],
+               meta=plan.get("meta_requirements") or [], moved=plan["moved_terms"],
+               ignored=plan["ignored_terms"], base=base.kind,
+               base_reason=plan.get("base_reason"), role_summary=plan.get("role_summary"),
+               semantic=plan.get("semantic_score"), fit=plan.get("fit_assessment"),
+               skills=[text for _, text in base.skill_lines])
     chosen, dropped, rehomed = select_blocks(plan, bank, base)
+    trace.page("pick", "Claude's picks", chosen, bank, base, terms,
+               list(rehomed or []) + [f"dropped {d}" for d in dropped or []])
     swaps = repair_coverage(chosen, bank, terms, base)
+    trace.page("repair", "Coverage repair", chosen, bank, base, terms, swaps)
     chosen, variety = enforce_variety(order_blocks(chosen, bank, terms), bank, terms, base)
+    trace.page("variety", "Strongest proof first, varied verbs", chosen, bank, base, terms,
+               variety)
     chosen, filled = fill_page(chosen, bank, plan, base)
+    trace.page("fill", "Page fill", chosen, bank, base, terms, filled)
     chosen = separate_repeats(order_blocks(chosen, bank, terms), bank)
+    trace.page("final", "Final page", chosen, bank, base, terms)
     rs = plan["recruiter"] = recruiter_score(plan, chosen, bank, base)
     plan["missing_keywords"] = rs["bank_gaps"]   # record_gaps pools only real bank gaps
     score, semantic = rs["score"], plan.get("semantic_score")
 
     gaps = record_gaps(plan, job, base.kind)
     passed = min_score is None or (score is not None and score >= min_score)
+    trace.emit("score", score=score, semantic=semantic, bar=min_score, passed=passed,
+               **{k: rs.get(k) for k in ("proven", "page_gaps", "bank_gaps", "claims_skills",
+                                         "claims_achievements", "padding")})
+    plan["live_trace"] = trace.path          # notify_discord adds the alert step to it
     log_score(job, plan, passed, min_score)
     if not passed:
         log.info("[%s] %s - recruiter %s/100 (semantic %s) below %s, no resume built",
                  job["company"], job["title"][:60], score, semantic, min_score)
+        trace.emit("skipped", score=score, bar=min_score)
         return {"folder": None, "score": score, "semantic_score": semantic,
                 "plan": plan, "passed": False}
 
@@ -1309,6 +1403,7 @@ def tailor_job(job, cfg, templates, bank, skills, model, notify=True, min_score=
                  "; ".join(re.sub(r"[`*]", "", v) for v in variety[:3]))
     if gaps:
         log.info("  %d bank gap(s) pooled into %s", len(rs["bank_gaps"]), gaps)
+    trace.emit("done", folder=folder, docx=docx)
     if notify:
         notify_discord(job, plan, folder)
     return {"folder": folder, "score": score, "semantic_score": semantic,
@@ -1318,6 +1413,8 @@ def tailor_job(job, cfg, templates, bank, skills, model, notify=True, min_score=
 def notify_discord(job, plan, folder):
     hook = os.environ.get("DISCORD_WEBHOOK_URL")
     if not hook:
+        append_live(plan.get("live_trace"), "alert", sent=False,
+                    reason="DISCORD_WEBHOOK_URL is not set")
         return
     rs = plan.get("recruiter") or {}
     score = rs.get("score") or 0
@@ -1341,10 +1438,15 @@ def notify_discord(job, plan, folder):
              "url": job.get("url") or None,
              "description": (plan.get("fit_assessment") or "")[:600], "color": color,
              "fields": fields}
+    sent = False
     try:
-        requests.post(hook, json={"embeds": [embed]}, timeout=15)
+        r = requests.post(hook, json={"embeds": [embed]}, timeout=15)
+        sent = r.status_code < 300
+        if not sent:
+            log.warning("discord notify failed: HTTP %s", r.status_code)
     except Exception as e:
         log.warning("discord notify failed: %s", e)
+    append_live(plan.get("live_trace"), "alert", sent=sent)
 
 
 def db_jobs(con, where, args=()):

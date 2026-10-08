@@ -186,6 +186,19 @@ when tailoring is off or `ANTHROPIC_API_KEY` is missing, so a misconfiguration c
 silently swallow every alert. For the same reason a match whose description can't be
 fetched, or whose scoring call still fails, alerts unscored rather than vanishing.
 
+### Watching it live
+
+While the watcher runs, open **http://127.0.0.1:8765**. Each posting it scores plays out
+side by side: the job description on the left with its required terms highlighted, the
+page on the right as it is assembled — Claude's picks, coverage repair, ordering and
+variety, page fill — with bullets sliding in and out, terms turning green as a bullet
+proves them, then the recruiter score, the .docx (the "Real .docx" tab renders the actual
+file) and whether Discord got the card.
+
+Every run is kept in `applications/_live/` (one JSON-lines file per posting), so the
+dropdown replays any past posting. With the watcher off, `python live_preview.py` serves
+the same page. It listens on 127.0.0.1 only. `tailor.live_preview: false` turns it off.
+
 ### What only you can fix
 
 The code can enforce *what* (their words) and *where* (inside a job). It cannot supply

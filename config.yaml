@@ -83,6 +83,9 @@ tailor:
                                 # Covered...) starts at most this many bullets, two in a
                                 # row never share one, and no claim prints twice.
                                 # Master templates are never changed by this.
+  live_preview: true            # watch each posting get built at http://127.0.0.1:8765
+                                # (served by the watcher; steps kept in applications/_live)
+  live_preview_port: 8765
   output_dir: applications
   page_budget:
     achievements: 5             # the one fixed block
